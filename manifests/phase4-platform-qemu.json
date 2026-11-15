@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "packet": "evidence/phase-4/platform-qemu/20261115T154301438335Z",
+  "nonce": "ce127c1e7efb4e36bf576924fb3de427",
+  "scope": "QEMU virt TCG Cortex-A53 GICv2, EL3 to nonsecure EL1 only",
+  "passed": true,
+  "build_packet": "evidence/phase-4/platform-build/20261115T154220836409Z",
+  "commands": [
+    [
+      "clang",
+      "--target=aarch64-none-elf",
+      "-mcpu=cortex-a53",
+      "-nostdlib",
+      "-fuse-ld=lld",
+      "-Wl,-Ttext=0x80080000",
+      "-Wl,--build-id=none",
+      "-DQEMU_STACK_PA=0x84280000",
+      "-DQEMU_BOOTARGS_PA=0x84240000",
+      "-DQEMU_XNU_ENTRY_PA=0x834314a8",
+      "/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/prototype/phase4-platform/qemu_entry.S",
+      "-o",
+      "/opt/a51-hakios/experimental/phase4-qemu/20261115T154301438335Z/entry.elf"
+    ],
+    [
+      "qemu-system-aarch64",
+      "-M",
+      "virt,gic-version=2,secure=on,virtualization=on",
+      "-cpu",
+      "cortex-a53",
+      "-smp",
+      "1",
+      "-m",
+      "2G",
+      "-accel",
+      "tcg,tb-size=384",
+      "-display",
+      "none",
+      "-serial",
+      "stdio",
+      "-monitor",
+      "none",
+      "-qmp",
+      "unix:/opt/a51-hakios/experimental/phase4-qemu/20261115T154301438335Z/monitor.sock,server=on,wait=off",
+      "-no-reboot",
+      "-device",
+      "loader,file=/opt/a51-hakios/experimental/phase4-qemu/20261115T154301438335Z/entry.elf,cpu-num=0",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-0-__TEXT.bin,addr=0x83004000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-1-__DATA_CONST.bin,addr=0x83160000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-2-__TEXT_EXEC.bin,addr=0x83248000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-3-__KLD.bin,addr=0x83aa4000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-4-__LASTDATA_CONST.bin,addr=0x83aa8000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-6-__KLDDATA.bin,addr=0x83aac000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-7-__DATA.bin,addr=0x83ab0000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-8-__BOOTDATA.bin,addr=0x83e98000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-16-__LINKINFO.bin,addr=0x83ee4000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/segment-17-__LINKEDIT.bin,addr=0x83f74000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/bootargs.bin,addr=0x84240000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/devicetree.bin,addr=0x84250000,force-raw=on",
+      "-device",
+      "loader,file=/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/evidence/phase-4/platform-qemu/20261115T154301438335Z/hello.bin,addr=0x84230000,force-raw=on"
+    ]
+  ],
+  "device_operations": false,
+  "phase_4_device_gate_passed": false,
+  "layout": {
+    "segments": [
+      [
+        2197831680,
+        2199257088
+      ],
+      [
+        2199257088,
+        2200207360
+      ],
+      [
+        2200207360,
+        2208972800
+      ],
+      [
+        2208972800,
+        2208989184
+      ],
+      [
+        2208989184,
+        2209005568
+      ],
+      [
+        2209005568,
+        2209021952
+      ],
+      [
+        2209021952,
+        2213117952
+      ],
+      [
+        2213117952,
+        2213429248
+      ],
+      [
+        2213429248,
+        2214019072
+      ],
+      [
+        2214019072,
+        2216867352
+      ]
+    ],
+    "ramdisk_pa": 2216886272,
+    "bootargs_pa": 2216951808,
+    "devicetree_pa": 2217017344,
+    "top": 2217082880,
+    "return_pa": 2148008156
+  },
+  "elapsed_seconds": 8.378306095,
+  "record": [
+    "0x315254514f494b48",
+    "0x83b449c0",
+    "0x58d6",
+    "0x0",
+    "0x0",
+    "0x410fd034",
+    "0x3b9aca0",
+    "0x80000000",
+    "0x4"
+  ],
+  "checks": {
+    "attributable_nonce": true,
+    "pid_1_root_console": true,
+    "three_measured_timer_samples": true,
+    "timer_pass": true,
+    "user_pass_and_zero_exit": true,
+    "no_test_failure": true,
+    "gicv2_single_core": true,
+    "midr_matches_capture": true,
+    "cortex_a53": true,
+    "expected_pid1_exit": true,
+    "physical_stub_return": true,
+    "counter_frequency": true,
+    "single_user_frame": true,
+    "a51_mmio_denied_with_valid_bootargs": true,
+    "snapshot_size_guard": true,
+    "spi_dispatch_mask_unmask_detach_reattach": true,
+    "diagnostics_pass": true,
+    "no_phone_mmio_reads": true
+  },
+  "timer_samples": [
+    [
+      "1",
+      "0",
+      "1006135",
+      "114",
+      "174",
+      "0",
+      "1"
+    ],
+    [
+      "2",
+      "0",
+      "1005469",
+      "181",
+      "240",
+      "0",
+      "1"
+    ],
+    [
+      "3",
+      "0",
+      "1002356",
+      "246",
+      "304",
+      "0",
+      "1"
+    ]
+  ],
+  "log": {
+    "bytes": 22742,
+    "sha256": "42a6aafbfb226be792a50c76460f5b33b160e0e065ea100df82f475edef771f7"
+  },
+  "qemu_exit_code": 0
+}

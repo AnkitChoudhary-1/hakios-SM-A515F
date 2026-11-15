@@ -1,0 +1,2244 @@
+--- /dev/null
++++ b/devices/a51/configs/a51_defconfig
+@@ -0,0 +1,31 @@
++# HakiOS defconfig for Samsung Galaxy A51 (SM-A515F / Exynos 9611)
++# Starts from common kernel and open profile; leaves out unsupported foreign drivers.
++#include common_defconfig
++#include open.config
++CONFIG_DEVICE="a51"
++# CONFIG_UFS is not set
++# CONFIG_TOUCHSCREEN is not set
++# CONFIG_HAKIOS_GOODIX is not set
++# CONFIG_HAKIOS_BUTTONS is not set
++# CONFIG_HAKIOS_UFS is not set
++# CONFIG_HAKIOS_ADRENO is not set
++# CONFIG_HAKIOS_CAMERA is not set
++# CONFIG_HAKIOS_TORCH is not set
++# CONFIG_HAKIOS_HAPTIC is not set
++# CONFIG_HAKIOS_ADSP is not set
++# CONFIG_HAKIOS_SPEAKER is not set
++# CONFIG_HAKIOS_SOUND is not set
++# CONFIG_HAKIOS_MIC is not set
++# CONFIG_HAKIOS_BATTERY is not set
++# CONFIG_HAKIOS_CPUFREQ is not set
++# CONFIG_HAKIOS_THERMAL is not set
++# CONFIG_HAKIOS_PMIC is not set
++# CONFIG_HAKIOS_BATTGUARD is not set
++# CONFIG_HAKIOS_SOCINFO is not set
++# CONFIG_HAKIOS_WIFI is not set
++# CONFIG_HAKIOS_BT is not set
++# CONFIG_HAKIOS_QMI is not set
++# CONFIG_HAKIOS_MODEM is not set
++
++# Phase 4 guarded diagnostics; inactive unless explicitly selected in bootargs.
++CONFIG_HAKIOS_A51=y
+--- /dev/null
++++ b/devices/a51/device.conf
+@@ -0,0 +1,15 @@
++# devices/a51/device.conf: Samsung Galaxy A51 (SM-A515F / Exynos 9611)
++
++device a51
++	title       Samsung Galaxy A51 (SM-A515F)
++	vendor      Samsung
++	soc         none
++	defconfig   a51_defconfig
++	maintainer  HakiOS Team
++	status      display     missing   Phase 4 DECON/DSIM driver planned
++	status      touch       missing   Phase 4 Melfas touch driver planned
++	status      buttons     missing   Phase 4 power/volume buttons planned
++	status      storage     missing   Phase 4 UFS block driver planned
++	status      audio       missing   Phase 8 ABOX driver planned
++	status      network     missing   Phase 7 SCSC WLBT driver planned
++	status      gpu         missing   Phase 6 Mali-G72 driver planned
+--- a/devices/manifest.conf
++++ b/devices/manifest.conf
+@@ -19,3 +19,6 @@
+ uefi hakios-uefi
+ 	repository  https://github.com/oosexgang/hakios-uefi.git
+ 	revision    1c6522893266157506c767e2ca427053ed3634a8
++
++device a51
++ path devices/a51
+--- /dev/null
++++ b/drivers/core/a51_input.h
+@@ -0,0 +1,242 @@
++/* SPDX-License-Identifier: MIT */
++/* Matching MSS100 format-10 decoder, GPIO transitions and bounded I2C read.
++ * Host fixtures establish the protocol only; hardware events remain distinct.
++ */
++#ifndef A51_INPUT_H
++#define A51_INPUT_H
++#define A51_INPUT_SLOTS 10u
++#define A51_INPUT_EVENT_BYTES 16u
++#define A51_INPUT_MAX_EVENTS 16u
++#define A51_INPUT_TOUCH 1u
++#define A51_INPUT_KEY 2u
++#define A51_INPUT_PRESS 1u
++#define A51_INPUT_MOVE 2u
++#define A51_INPUT_RELEASE 3u
++#define A51_INPUT_INVAL (-22)
++#define A51_INPUT_PROTOCOL (-71)
++#define A51_INPUT_BUSY (-16)
++#define A51_INPUT_TIMEOUT (-110)
++#define A51_INPUT_NACK (-6)
++#define A51_INPUT_ARBITRATION (-11)
++#define A51_INPUT_IO (-5)
++
++struct a51_input_event {
++    unsigned int kind, code, state, slot, raw_x, raw_y, x, y;
++    unsigned long long counter;
++    unsigned char packet[A51_INPUT_EVENT_BYTES];
++};
++_Static_assert(sizeof(struct a51_input_event) == 56, "input event ABI");
++struct a51_touch_state { unsigned int active; };
++struct a51_key_state {
++    unsigned int initialized, stable, candidate;
++    unsigned long long changed_us, observed_us;
++};
++
++static inline int
++a51_touch_decode(const unsigned char *p, unsigned int bytes, unsigned int format,
++    struct a51_input_event *e)
++{
++    if (!p || !e || bytes != 16 || format != 10) { return A51_INPUT_INVAL; }
++    unsigned int state = p[0] >> 6, type = p[0] & 3;
++    /* Format 10 state 0 means no event; the matching Android driver ignores it. */
++    if (!state || type == 0) { return 0; }
++    unsigned int id = (p[0] >> 2) & 15;
++    if (type != 1 || !id || id > A51_INPUT_SLOTS) { return A51_INPUT_PROTOCOL; }
++    e->kind = A51_INPUT_TOUCH; e->code = 0; e->state = state; e->slot = id - 1;
++    e->raw_x = ((unsigned int)p[1] << 4) | (p[3] >> 4);
++    e->raw_y = ((unsigned int)p[2] << 4) | (p[3] & 15);
++    e->x = (e->raw_x * 1079u + 2047u) / 4095u;
++    e->y = (e->raw_y * 2399u + 2047u) / 4095u;
++    for (unsigned int i = 0; i < 16; i++) { e->packet[i] = p[i]; }
++    return 1;
++}
++
++/* Reject an entire malformed packet before changing the touch state. */
++static inline int
++a51_touch_packet(struct a51_touch_state *s, const unsigned char *p, unsigned int bytes,
++    unsigned int format, unsigned long long counter, struct a51_input_event *out,
++    unsigned int capacity)
++{
++    if (!s || !p || !out || !bytes || bytes > 127 || bytes % 16 || format != 10 || capacity < bytes / 16) {
++        return A51_INPUT_INVAL;
++    }
++    struct a51_input_event scratch = {0};
++    for (unsigned int i = 0; i < bytes; i += 16) {
++        int rc = a51_touch_decode(p + i, 16, format, &scratch);
++        if (rc < 0) { return rc; }
++    }
++    unsigned int count = 0;
++    for (unsigned int i = 0; i < bytes; i += 16) {
++        int rc = a51_touch_decode(p + i, 16, format, &out[count]);
++        if (!rc) { continue; }
++        struct a51_input_event *e = &out[count++];
++        e->counter = counter;
++        if (e->state == A51_INPUT_RELEASE) { s->active &= ~(1u << e->slot); }
++        else { s->active |= 1u << e->slot; }
++    }
++    return (int)count;
++}
++
++static inline unsigned int
++a51_keys_sample(struct a51_key_state *s, unsigned int gpa1, unsigned long long us,
++    unsigned long long counter, struct a51_input_event *out)
++{
++    if (!s || !out) { return 0; }
++    unsigned int pressed = (~gpa1 >> 5) & 7u; /* active low: volume up/down, power */
++    if (!s->initialized) {
++        s->initialized = 1; s->stable = s->candidate = pressed;
++        s->changed_us = s->observed_us = us;
++        return 0; /* a snapshot is not a transition */
++    }
++    if (us < s->observed_us) {
++        /* Restart the candidate's interval after any clock regression. */
++        s->candidate = pressed; s->changed_us = s->observed_us = us;
++        return 0;
++    }
++    s->observed_us = us;
++    if (pressed != s->candidate) { s->candidate = pressed; s->changed_us = us; return 0; }
++    if (us - s->changed_us < 20000) { return 0; }
++    static const unsigned int codes[3] = {115, 114, 116};
++    unsigned int changed = s->stable ^ pressed, count = 0;
++    for (unsigned int i = 0; i < 3; i++) {
++        if (!(changed & (1u << i))) { continue; }
++        struct a51_input_event *e = &out[count++];
++        e->kind = A51_INPUT_KEY; e->code = codes[i];
++        e->state = (pressed >> i) & 1u; e->slot = 0;
++        e->raw_x = e->raw_y = e->x = e->y = 0; e->counter = counter;
++        for (unsigned int j = 0; j < 16; j++) { e->packet[j] = 0; }
++    }
++    s->stable = pressed;
++    return count;
++}
++
++#define A51_I2C_CON 0u
++#define A51_I2C_STAT 4u
++#define A51_I2C_DATA 12u
++#define A51_I2C_ACK 128u
++#define A51_I2C_IRQ 32u
++#define A51_I2C_PENDING 16u
++#define A51_I2C_BUSY 32u
++#define A51_I2C_ENABLE 16u
++#define A51_I2C_ARB 8u
++#define A51_I2C_LASTBIT 1u
++struct a51_i2c_io {
++    void *context;
++    unsigned int (*read)(void *, unsigned int);
++    void (*write)(void *, unsigned int, unsigned int);
++    unsigned long long (*now_us)(void *);
++    void (*delay_us)(void *, unsigned int);
++    void (*barrier)(void *);
++};
++struct a51_i2c_report {
++    int rc;
++    unsigned int initial_con, initial_stat, final_con, final_stat, received, stopped, restored;
++};
++
++static inline int
++a51_i2c_wait(const struct a51_i2c_io *io, unsigned int reg, unsigned int mask,
++    unsigned int expected, unsigned int us)
++{
++    unsigned long long start = io->now_us(io->context);
++    for (unsigned int polls = 0; polls < 20000; polls++) {
++        if (reg == A51_I2C_CON && (io->read(io->context, A51_I2C_STAT) & A51_I2C_ARB)) {
++            return A51_INPUT_ARBITRATION;
++        }
++        if ((io->read(io->context, reg) & mask) == expected) { return 0; }
++        if (io->now_us(io->context) - start >= us) { break; }
++        io->delay_us(io->context, 5);
++    }
++    return A51_INPUT_TIMEOUT;
++}
++
++static inline int
++a51_i2c_ack(const struct a51_i2c_io *io)
++{
++    int rc = a51_i2c_wait(io, A51_I2C_CON, A51_I2C_PENDING, A51_I2C_PENDING, 5000);
++    if (rc) { return rc; }
++    return (io->read(io->context, A51_I2C_STAT) & A51_I2C_LASTBIT) ? A51_INPUT_NACK : 0;
++}
++
++/* Fixed MSS100 address, a two-byte register selector followed by a bounded
++ * read. It cannot write panel settings, flash firmware, or arbitrary slaves.
++ * No retry, clock/pin/power reset or inherited-busy cancellation is performed.
++ */
++static inline int
++a51_i2c_mss_read(const struct a51_i2c_io *io, unsigned int *quarantined,
++    unsigned char page, unsigned char reg, unsigned char *out, unsigned int bytes,
++    struct a51_i2c_report *r)
++{
++    if (!io || !quarantined || !out || !r || !io->read || !io->write || !io->now_us ||
++        !io->delay_us || !io->barrier || !bytes || bytes > 127 || page != 2 ||
++        (reg != 4 && reg != 0x10 && reg != 0x11)) { return A51_INPUT_INVAL; }
++    *r = (struct a51_i2c_report){0};
++    if (*quarantined) { return r->rc = A51_INPUT_BUSY; }
++    r->initial_con = io->read(io->context, A51_I2C_CON);
++    r->initial_stat = io->read(io->context, A51_I2C_STAT);
++    if ((r->initial_stat & (A51_I2C_BUSY | A51_I2C_ARB)) ||
++        (r->initial_con & A51_I2C_PENDING)) { return r->rc = A51_INPUT_BUSY; }
++    unsigned char received[127];
++    unsigned int con = (r->initial_con & ~A51_I2C_PENDING) | A51_I2C_ACK | A51_I2C_IRQ;
++    io->write(io->context, A51_I2C_STAT, 0xc0 | A51_I2C_ENABLE);
++    io->write(io->context, A51_I2C_CON, con);
++    io->write(io->context, A51_I2C_DATA, 0x48u << 1);
++    io->delay_us(io->context, 5);
++    io->write(io->context, A51_I2C_STAT, 0xc0 | A51_I2C_ENABLE | A51_I2C_BUSY);
++    io->barrier(io->context);
++    int error = a51_i2c_ack(io);
++    unsigned char prefix[2] = {page, reg};
++    for (unsigned int i = 0; !error && i < 2; i++) {
++        io->write(io->context, A51_I2C_DATA, prefix[i]);
++        io->delay_us(io->context, 5);
++        io->write(io->context, A51_I2C_CON, con & ~A51_I2C_PENDING);
++        io->barrier(io->context);
++        error = a51_i2c_ack(io);
++    }
++    if (!error) {
++        /* Keep the preceding pending flag until the repeated START is set. */
++        io->write(io->context, A51_I2C_STAT, 0x80 | A51_I2C_ENABLE);
++        io->write(io->context, A51_I2C_DATA, (0x48u << 1) | 1u);
++        io->delay_us(io->context, 5);
++        io->write(io->context, A51_I2C_STAT, 0x80 | A51_I2C_ENABLE | A51_I2C_BUSY);
++        io->write(io->context, A51_I2C_CON, con & ~A51_I2C_PENDING);
++        io->barrier(io->context);
++        error = a51_i2c_ack(io);
++    }
++    for (unsigned int i = 0; !error && i < bytes; i++) {
++        unsigned int next_con = con & ~A51_I2C_PENDING;
++        if (i + 1 == bytes) { next_con &= ~A51_I2C_ACK; } /* NACK the final byte */
++        io->write(io->context, A51_I2C_CON, next_con);
++        io->barrier(io->context);
++        error = a51_i2c_wait(io, A51_I2C_CON, A51_I2C_PENDING, A51_I2C_PENDING, 5000);
++        if (!error) { received[i] = (unsigned char)io->read(io->context, A51_I2C_DATA); r->received++; }
++    }
++    /* Matching controller STOP order: STAT.BUSY=0, CON.PENDING=0, wait. */
++    unsigned int stat = io->read(io->context, A51_I2C_STAT);
++    io->write(io->context, A51_I2C_STAT, stat & ~(A51_I2C_BUSY | A51_I2C_ARB | A51_I2C_LASTBIT));
++    io->write(io->context, A51_I2C_CON, con & ~(A51_I2C_PENDING | A51_I2C_IRQ));
++    io->barrier(io->context);
++    int stop = a51_i2c_wait(io, A51_I2C_STAT, A51_I2C_BUSY, 0, 25000);
++    if (stop) { *quarantined = 1; r->rc = stop; }
++    else {
++        r->stopped = 1;
++        io->write(io->context, A51_I2C_STAT, r->initial_stat & (0xc0 | A51_I2C_ENABLE));
++        io->write(io->context, A51_I2C_CON, r->initial_con & ~A51_I2C_PENDING);
++        io->barrier(io->context);
++        r->rc = error;
++    }
++    r->final_con = io->read(io->context, A51_I2C_CON);
++    r->final_stat = io->read(io->context, A51_I2C_STAT);
++    if (r->stopped) {
++        if (r->final_con != (r->initial_con & ~A51_I2C_PENDING) ||
++            (r->final_stat & (0xc0 | A51_I2C_ENABLE | A51_I2C_BUSY | A51_I2C_ARB)) !=
++                (r->initial_stat & (0xc0 | A51_I2C_ENABLE))) {
++            *quarantined = 1; r->rc = A51_INPUT_IO;
++        } else { r->restored = 1; }
++    }
++    /* Failed transfers never expose partial or unrestored data to the decoder. */
++    if (!r->rc && r->restored) {
++        for (unsigned int i = 0; i < bytes; i++) { out[i] = received[i]; }
++    }
++    return r->rc;
++}
++#endif
+--- /dev/null
++++ b/drivers/core/a51_ufs_readonly.h
+@@ -0,0 +1,362 @@
++/* SPDX-License-Identifier: MIT */
++/* Bounded Exynos UFS diagnostic. Shared unchanged by XNU and native tests.
++ * Matching references: ufshci.h, ufshcd.c, ufs-exynos.c and crypto/fmp.h.
++ * This adopts an already initialized, idle link; it does not initialize PHYs.
++ * The only accepted command is READ(10), LUN 0, within the boot partition.
++ */
++#ifndef A51_UFS_READONLY_H
++#define A51_UFS_READONLY_H
++
++#define A51_UFS_READ 0u
++#define A51_UFS_WRITE 1u
++#define A51_UFS_RO (-30)
++#define A51_UFS_INVAL (-22)
++#define A51_UFS_BUSY (-16)
++#define A51_UFS_IO (-5)
++#define A51_UFS_TIMEOUT (-110)
++#define A51_UFS_PROTOCOL (-71)
++#define A51_UFS_UNSUPPORTED (-95)
++#define A51_UFS_BOOT_LBA 27792u
++#define A51_UFS_BOOT_BLOCKS 15104u
++#define A51_UFS_BLOCK_SIZE 4096u
++#define A51_UFS_MAX_BLOCKS 16u
++#define A51_UFS_DMA_BYTES 65536u
++#define A51_UFS_ERROR_MASK 0x00070884u
++
++#define A51_UFS_CAP 0x00u
++#define A51_UFS_VER 0x08u
++#define A51_UFS_IS 0x20u
++#define A51_UFS_HCS 0x30u
++#define A51_UFS_HCE 0x34u
++#define A51_UFS_LIST_LO 0x50u
++#define A51_UFS_LIST_HI 0x54u
++#define A51_UFS_DOORBELL 0x58u
++#define A51_UFS_CLEAR 0x5cu
++#define A51_UFS_RUN 0x60u
++#define A51_UFS_TASK_DOORBELL 0x78u
++#define A51_UFS_TX_PRDT 0x00u /* separate vendor HCI at 0x13521100 */
++#define A51_UFS_RX_PRDT 0x04u
++#define A51_UFS_NEXUS 0x40u
++#define A51_UFS_REORDER 0x60u
++
++enum a51_ufs_stage {
++    A51_UFS_PREFLIGHT = 1, A51_UFS_PREPARED, A51_UFS_ADOPTED,
++    A51_UFS_SUBMITTED, A51_UFS_COMPLETED, A51_UFS_VALIDATED,
++    A51_UFS_RESTORED, A51_UFS_QUARANTINED
++};
++
++/* ARM64 and the native test host are little endian; UPIUs are big endian. */
++struct a51_ufs_utrd {
++    unsigned int dw0, dw1, ocs, dw3, cmd_lo, cmd_hi;
++    unsigned short rsp_len, rsp_off, prdt_len, prdt_off;
++};
++struct a51_ufs_fmp_prdt { unsigned int words[32]; };
++struct a51_ufs_command {
++    unsigned char request[1024], response[1024];
++    struct a51_ufs_fmp_prdt prdt[16];
++};
++_Static_assert(sizeof(unsigned int) == 4 && sizeof(unsigned short) == 2, "UFS word sizes");
++_Static_assert(sizeof(struct a51_ufs_utrd) == 32, "UTRD size");
++_Static_assert(sizeof(struct a51_ufs_fmp_prdt) == 128, "matching UFS FMP stride");
++_Static_assert(sizeof(struct a51_ufs_command) == 4096, "UFS command size");
++
++struct a51_ufs_io {
++    void *context;
++    unsigned int (*read)(void *, unsigned int vendor, unsigned int offset);
++    void (*write)(void *, unsigned int vendor, unsigned int offset, unsigned int value);
++    unsigned long long (*physical)(void *, const void *);
++    void (*clean)(void *, const void *, unsigned int);
++    void (*invalidate)(void *, const void *, unsigned int);
++    void (*barrier)(void *);
++    unsigned long long (*now_us)(void *);
++    void (*relax)(void *);
++    void (*trace)(void *, unsigned int stage);
++};
++struct a51_ufs_memory {
++    struct a51_ufs_utrd *list; /* 32 slots, 1024 bytes */
++    struct a51_ufs_command *command;
++    unsigned char *data; /* 65536 bytes */
++    unsigned int kernel_owned, quarantined;
++};
++struct a51_ufs_report {
++    int rc;
++    unsigned int stages, submitted, completed, restored, quarantined;
++    unsigned int cap, version, hcs, hce, initial_is, final_is;
++    unsigned int initial_lo, initial_hi, initial_run, initial_doorbell, initial_task;
++    unsigned int tx_prdt, rx_prdt, nexus, reorder, final_doorbell, final_run;
++    unsigned int ocs, transaction, response, status, residual, flags, sense_length;
++    unsigned int lba, blocks, bytes;
++    unsigned long long list_pa, command_pa, data_pa;
++};
++
++static inline void
++a51_ufs_zero(void *out, unsigned int bytes)
++{
++    unsigned char *p = (unsigned char *)out;
++    while (bytes--) { *p++ = 0; }
++}
++
++static inline unsigned int
++a51_ufs_be32(const unsigned char *p)
++{
++    return ((unsigned int)p[0] << 24) | ((unsigned int)p[1] << 16) |
++        ((unsigned int)p[2] << 8) | p[3];
++}
++
++static inline void
++a51_ufs_put_be32(unsigned char *p, unsigned int value)
++{
++    p[0] = (unsigned char)(value >> 24); p[1] = (unsigned char)(value >> 16);
++    p[2] = (unsigned char)(value >> 8); p[3] = (unsigned char)value;
++}
++
++static inline int
++a51_ufs_overlap(unsigned long long a, unsigned int an, unsigned long long b, unsigned int bn)
++{
++    return a < b + bn && b < a + an;
++}
++
++/* Check every 4 KiB boundary AND the last byte. No guessed DMA apertures,
++ * translation of only the first page, aliases, or truncation to 32 bits.
++ */
++static inline int
++a51_ufs_span(const struct a51_ufs_io *io, const void *ptr, unsigned int bytes,
++    unsigned int alignment, unsigned long long *physical)
++{
++    unsigned long long va = (unsigned long long)(unsigned long)ptr;
++    if (!ptr || !bytes || (va & (alignment - 1)) || va + bytes < va) { return A51_UFS_INVAL; }
++    unsigned long long pa = io->physical(io->context, ptr);
++    if (!pa || (pa & (alignment - 1)) || pa > 0xffffffffULL || bytes - 1 > 0xffffffffULL - pa) {
++        return A51_UFS_INVAL;
++    }
++    for (unsigned int offset = 0; offset < bytes; offset += 4096) {
++        if (io->physical(io->context, (const unsigned char *)ptr + offset) != pa + offset) {
++            return A51_UFS_INVAL;
++        }
++    }
++    if (io->physical(io->context, (const unsigned char *)ptr + bytes - 1) != pa + bytes - 1) {
++        return A51_UFS_INVAL;
++    }
++    *physical = pa;
++    return 0;
++}
++
++static inline void
++a51_ufs_mark(const struct a51_ufs_io *io, struct a51_ufs_report *r, unsigned int stage)
++{
++    r->stages |= 1u << stage;
++    if (io->trace) { io->trace(io->context, stage); }
++}
++
++static inline int
++a51_ufs_wait(const struct a51_ufs_io *io, unsigned int reg, unsigned int mask,
++    unsigned int expected, unsigned int us)
++{
++    unsigned long long started = io->now_us(io->context);
++    /* The poll limit also bounds a broken/nonadvancing counter. */
++    for (unsigned int polls = 0; polls < 1000000u; polls++) {
++        if ((io->read(io->context, 0, reg) & mask) == expected) { return 0; }
++        if (io->now_us(io->context) - started >= us) { break; }
++        io->relax(io->context);
++    }
++    return A51_UFS_TIMEOUT;
++}
++
++static inline int
++a51_ufs_quarantine(const struct a51_ufs_io *io, struct a51_ufs_memory *m,
++    struct a51_ufs_report *r, int error)
++{
++    /* Keep all buffers owned until reset. Never invalidate, hash, overwrite,
++     * unmap, or reuse them while completion/stop cannot be proved.
++     */
++    m->quarantined = r->quarantined = 1;
++    r->rc = error;
++    a51_ufs_mark(io, r, A51_UFS_QUARANTINED);
++    return error;
++}
++
++static inline int
++a51_ufs_restore(const struct a51_ufs_io *io, struct a51_ufs_memory *m,
++    struct a51_ufs_report *r)
++{
++    r->final_doorbell = io->read(io->context, 0, A51_UFS_DOORBELL);
++    if (r->final_doorbell || io->read(io->context, 0, A51_UFS_TASK_DOORBELL)) {
++        return a51_ufs_quarantine(io, m, r, A51_UFS_BUSY);
++    }
++    io->write(io->context, 0, A51_UFS_RUN, 0);
++    io->barrier(io->context);
++    if (a51_ufs_wait(io, A51_UFS_RUN, 1, 0, 25000)) {
++        return a51_ufs_quarantine(io, m, r, A51_UFS_TIMEOUT);
++    }
++    /* Recheck both doorbells after stop before replacing any list pointer. */
++    if (io->read(io->context, 0, A51_UFS_DOORBELL) || io->read(io->context, 0, A51_UFS_TASK_DOORBELL)) {
++        return a51_ufs_quarantine(io, m, r, A51_UFS_BUSY);
++    }
++    io->write(io->context, 0, A51_UFS_LIST_LO, r->initial_lo);
++    io->write(io->context, 0, A51_UFS_LIST_HI, r->initial_hi);
++    io->write(io->context, 1, A51_UFS_NEXUS, r->nexus);
++    io->barrier(io->context);
++    if (io->read(io->context, 0, A51_UFS_LIST_LO) != r->initial_lo ||
++        io->read(io->context, 0, A51_UFS_LIST_HI) != r->initial_hi ||
++        io->read(io->context, 1, A51_UFS_NEXUS) != r->nexus) {
++        return a51_ufs_quarantine(io, m, r, A51_UFS_IO);
++    }
++    io->write(io->context, 0, A51_UFS_RUN, r->initial_run & 1u);
++    io->barrier(io->context);
++    if (a51_ufs_wait(io, A51_UFS_RUN, 1, r->initial_run & 1u, 25000)) {
++        return a51_ufs_quarantine(io, m, r, A51_UFS_TIMEOUT);
++    }
++    r->final_run = io->read(io->context, 0, A51_UFS_RUN);
++    r->restored = 1;
++    a51_ufs_mark(io, r, A51_UFS_RESTORED);
++    return 0;
++}
++
++static inline int
++a51_ufs_submit(const struct a51_ufs_io *io, struct a51_ufs_memory *m,
++    unsigned int operation, unsigned int lba, unsigned int blocks, struct a51_ufs_report *r)
++{
++    /* This check is the actual submission path, before even dereferencing
++     * io, m or r. Unknown operations cannot bypass the read-only restriction.
++     */
++    if (operation != A51_UFS_READ) { return A51_UFS_RO; }
++    if (!io || !m || !r || !io->read || !io->write || !io->physical || !io->clean ||
++        !io->invalidate || !io->barrier || !io->now_us || !io->relax ||
++        !blocks || blocks > A51_UFS_MAX_BLOCKS || lba < A51_UFS_BOOT_LBA ||
++        lba - A51_UFS_BOOT_LBA > A51_UFS_BOOT_BLOCKS - blocks) { return A51_UFS_INVAL; }
++    a51_ufs_zero(r, sizeof(*r));
++    r->ocs = 15; r->lba = lba; r->blocks = blocks; r->bytes = blocks * A51_UFS_BLOCK_SIZE;
++    if (m->quarantined) { r->quarantined = 1; return r->rc = A51_UFS_BUSY; }
++    if (m->kernel_owned != 1 ||
++        a51_ufs_span(io, m->list, 1024, 1024, &r->list_pa) ||
++        a51_ufs_span(io, m->command, 4096, 4096, &r->command_pa) ||
++        a51_ufs_span(io, m->data, A51_UFS_DMA_BYTES, 4096, &r->data_pa) ||
++        a51_ufs_overlap(r->list_pa, 1024, r->command_pa, 4096) ||
++        a51_ufs_overlap(r->list_pa, 1024, r->data_pa, A51_UFS_DMA_BYTES) ||
++        a51_ufs_overlap(r->command_pa, 4096, r->data_pa, A51_UFS_DMA_BYTES)) {
++        return r->rc = A51_UFS_INVAL;
++    }
++    a51_ufs_mark(io, r, A51_UFS_PREFLIGHT);
++    r->cap = io->read(io->context, 0, A51_UFS_CAP);
++    r->version = io->read(io->context, 0, A51_UFS_VER);
++    r->hcs = io->read(io->context, 0, A51_UFS_HCS);
++    r->hce = io->read(io->context, 0, A51_UFS_HCE);
++    r->initial_lo = io->read(io->context, 0, A51_UFS_LIST_LO);
++    r->initial_hi = io->read(io->context, 0, A51_UFS_LIST_HI);
++    r->initial_run = io->read(io->context, 0, A51_UFS_RUN);
++    r->initial_doorbell = io->read(io->context, 0, A51_UFS_DOORBELL);
++    r->initial_task = io->read(io->context, 0, A51_UFS_TASK_DOORBELL);
++    r->initial_is = io->read(io->context, 0, A51_UFS_IS);
++    if (r->initial_doorbell || r->initial_task) { return r->rc = A51_UFS_BUSY; }
++    r->tx_prdt = io->read(io->context, 1, A51_UFS_TX_PRDT);
++    r->rx_prdt = io->read(io->context, 1, A51_UFS_RX_PRDT);
++    r->nexus = io->read(io->context, 1, A51_UFS_NEXUS);
++    r->reorder = io->read(io->context, 1, A51_UFS_REORDER);
++    if (!(r->hce & 1) || (r->hcs & 3) != 3 || (r->hcs & 0x30) ||
++        (r->initial_is & A51_UFS_ERROR_MASK)) { return r->rc = A51_UFS_IO; }
++    /* No format trials or crypto/prefetch changes. These matching settings
++     * require the 128-byte zeroed FMP extension and byte-unit descriptor.
++     */
++    if (r->tx_prdt != 0x8000000cu || r->rx_prdt != 0xcu || r->reorder != 0xau) {
++        return r->rc = A51_UFS_UNSUPPORTED;
++    }
++    if (io->read(io->context, 0, A51_UFS_DOORBELL) || io->read(io->context, 0, A51_UFS_TASK_DOORBELL)) {
++        return r->rc = A51_UFS_BUSY;
++    }
++    a51_ufs_zero(m->list, 1024);
++    a51_ufs_zero(m->command, 4096);
++    a51_ufs_zero(m->data, A51_UFS_DMA_BYTES);
++    struct a51_ufs_utrd *u = &m->list[0];
++    struct a51_ufs_command *c = m->command;
++    u->dw0 = 0x15000000u; /* storage command | device-to-host | interrupt */
++    u->ocs = 15; u->cmd_lo = (unsigned int)r->command_pa; u->cmd_hi = 0;
++    u->rsp_off = u->rsp_len = 1024; u->prdt_off = 2048; u->prdt_len = 128;
++    c->request[0] = 1; c->request[1] = 0x40; /* COMMAND, READ, LUN/tag 0 */
++    a51_ufs_put_be32(c->request + 12, r->bytes);
++    c->request[16] = 0x28; /* READ(10), the sole allowed CDB */
++    a51_ufs_put_be32(c->request + 18, lba);
++    c->request[23] = (unsigned char)(blocks >> 8); c->request[24] = (unsigned char)blocks;
++    c->prdt[0].words[0] = (unsigned int)r->data_pa;
++    c->prdt[0].words[3] = r->bytes - 1; /* crypto flags/extensions remain zero */
++    io->clean(io->context, m->data, A51_UFS_DMA_BYTES);
++    io->clean(io->context, m->command, 4096);
++    io->clean(io->context, m->list, 1024);
++    io->barrier(io->context);
++    a51_ufs_mark(io, r, A51_UFS_PREPARED);
++    io->write(io->context, 0, A51_UFS_RUN, 0);
++    io->barrier(io->context);
++    if (a51_ufs_wait(io, A51_UFS_RUN, 1, 0, 25000)) {
++        return a51_ufs_quarantine(io, m, r, A51_UFS_TIMEOUT);
++    }
++    if (io->read(io->context, 0, A51_UFS_DOORBELL) || io->read(io->context, 0, A51_UFS_TASK_DOORBELL)) {
++        return a51_ufs_quarantine(io, m, r, A51_UFS_BUSY);
++    }
++    io->write(io->context, 0, A51_UFS_LIST_LO, (unsigned int)r->list_pa);
++    io->write(io->context, 0, A51_UFS_LIST_HI, 0);
++    io->write(io->context, 1, A51_UFS_NEXUS, r->nexus | 1u);
++    io->barrier(io->context);
++    a51_ufs_mark(io, r, A51_UFS_ADOPTED);
++    int error = 0;
++    if (io->read(io->context, 0, A51_UFS_LIST_LO) != (unsigned int)r->list_pa ||
++        io->read(io->context, 0, A51_UFS_LIST_HI) != 0 ||
++        io->read(io->context, 1, A51_UFS_NEXUS) != (r->nexus | 1u)) {
++        error = A51_UFS_IO;
++    } else {
++        io->write(io->context, 0, A51_UFS_RUN, 1);
++        io->barrier(io->context);
++        error = a51_ufs_wait(io, A51_UFS_RUN, 1, 1, 25000);
++    }
++    if (!error && (io->read(io->context, 0, A51_UFS_DOORBELL) ||
++        io->read(io->context, 0, A51_UFS_TASK_DOORBELL))) { error = A51_UFS_BUSY; }
++    if (!error) {
++        r->submitted = 1;
++        a51_ufs_mark(io, r, A51_UFS_SUBMITTED);
++        io->write(io->context, 0, A51_UFS_DOORBELL, 1);
++        io->barrier(io->context);
++        error = a51_ufs_wait(io, A51_UFS_DOORBELL, 1, 0, 250000);
++        if (error) {
++            /* BROKEN_REQ_LIST_CLR: selected bit, never its complement and
++             * never a mask of inherited requests. No DMA buffer access here.
++             */
++            io->write(io->context, 0, A51_UFS_CLEAR, 1);
++            io->barrier(io->context);
++            if (a51_ufs_wait(io, A51_UFS_DOORBELL, 1, 0, 25000)) {
++                r->final_doorbell = io->read(io->context, 0, A51_UFS_DOORBELL);
++                return a51_ufs_quarantine(io, m, r, A51_UFS_TIMEOUT);
++            }
++        } else {
++            r->completed = 1;
++            a51_ufs_mark(io, r, A51_UFS_COMPLETED);
++        }
++    }
++    /* Stop, prove quiescence and restore the original configuration before
++     * touching DMA results. A cleared request is still a failed read.
++     */
++    r->final_is = io->read(io->context, 0, A51_UFS_IS);
++    io->barrier(io->context);
++    if (a51_ufs_restore(io, m, r)) { return r->rc; }
++    if (error) { return r->rc = error; }
++    io->invalidate(io->context, m->list, 1024);
++    io->invalidate(io->context, m->command, 4096);
++    io->invalidate(io->context, m->data, A51_UFS_DMA_BYTES);
++    io->barrier(io->context);
++    r->ocs = u->ocs & 15u;
++    r->transaction = c->response[0]; r->flags = c->response[1];
++    r->response = c->response[6]; r->status = c->response[7];
++    r->residual = a51_ufs_be32(c->response + 12);
++    r->sense_length = ((unsigned int)c->response[32] << 8) | c->response[33];
++    if ((r->ocs != 0 && !(r->ocs == 7 && *(const unsigned int *)m->data == 0x52444e41)) ||
++        (r->final_is & A51_UFS_ERROR_MASK)) {
++        return r->rc = A51_UFS_IO;
++    }
++    if (r->transaction != 0x21 || c->response[2] != 0 || c->response[3] != 0 ||
++        r->response || r->status || r->residual || (r->flags & 0x60) ||
++        c->response[8] || c->response[10] || c->response[11] || r->sense_length) {
++        if (!(r->ocs == 7 && *(const unsigned int *)m->data == 0x52444e41)) {
++            return r->rc = A51_UFS_PROTOCOL;
++        }
++    }
++    a51_ufs_mark(io, r, A51_UFS_VALIDATED);
++    return r->rc = 0;
++}
++#endif
+--- a/drivers/core/conf
++++ b/drivers/core/conf
+@@ -19,3 +19,7 @@
+ 	file    bsd/dev/hakios.socinfo.c
+ 	help    the chip's identity from the firmware's shared memory: kern.hakios.soc_* (socinfo=1). Any Qualcomm SoC
+ 	help    that keeps SMEM item 137; where the shared memory is comes from soc_smem=
++
++driver A51
++	file    bsd/dev/hakios.a51.c
++	help    Explicitly guarded A51 MMIO diagnostics; no peripheral initialization
+--- /dev/null
++++ b/drivers/core/hakios.a51.c
+@@ -0,0 +1,629 @@
++/* SPDX-License-Identifier: MIT */
++/*
++ * SM-A515F/Exynos 9611 early controller diagnostics. Register facts are traced
++ * to the retained matching Android DTS and cal_9610/ufshci/i2c-s3c2410 files.
++ * This file does not initialize peripherals or establish Phase 4 completion.
++ * Boot firmware must keep the selected controller clock/power domains alive.
++ */
++#include <kern/locks.h>
++#include <libkern/libkern.h>
++#include <sys/errno.h>
++#include <sys/sysctl.h>
++#include <sys/systm.h>
++#include <pexpert/pexpert.h>
++#include <pexpert/arm64/board_config.h>
++#include <arm/machine_routines.h>
++#include <mach/mach_types.h>
++#include "hakios.a51.h"
++#include "a51_ufs_readonly.h"
++#include "a51_input.h"
++
++/* BSD lacks MACH_KERNEL_PRIVATE/PEXPERT_KERNEL_PRIVATE. Match the
++ * osfmk/arm/machine_routines.h declaration, as existing BSD drivers do. */
++extern vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++extern vm_offset_t ml_io_map_unmappable(vm_offset_t phys_addr, vm_size_t size, unsigned int flags);
++extern unsigned long long kvtophys(vm_offset_t va);
++#define VM_WIMG_DEFAULT 0x0
++#define VM_WIMG_WCOMB   0x2
++
++static inline void
++a51_dcache_inval_range(vm_offset_t va, vm_size_t size)
++{
++    vm_offset_t addr = va & ~63ULL;
++    vm_offset_t end = va + size;
++    __asm__ volatile("dsb sy" ::: "memory");
++    for (; addr < end; addr += 64) {
++        __asm__ volatile("dc ivac, %0" :: "r"(addr) : "memory");
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    __asm__ volatile("isb" ::: "memory");
++}
++
++static inline void
++a51_dcache_flush_range(vm_offset_t va, vm_size_t size)
++{
++    vm_offset_t addr = va & ~63ULL;
++    vm_offset_t end = va + size;
++    __asm__ volatile("dsb sy" ::: "memory");
++    for (; addr < end; addr += 64) {
++        __asm__ volatile("dc civac, %0" :: "r"(addr) : "memory");
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    __asm__ volatile("isb" ::: "memory");
++}
++
++/* Freestanding SHA-256 Algorithm */
++struct a51_sha256_ctx {
++    unsigned int state[8];
++    unsigned long long count;
++    unsigned char buffer[64];
++};
++
++static void
++a51_sha256_transform(unsigned int state[8], const unsigned char data[64])
++{
++    static const unsigned int K[64] = {
++        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
++        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
++        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
++        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
++        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
++        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
++        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
++        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
++    };
++    unsigned int a = state[0], b = state[1], c = state[2], d = state[3];
++    unsigned int e = state[4], f = state[5], g = state[6], h = state[7];
++    unsigned int W[64];
++
++    for (int i = 0; i < 16; i++) {
++        W[i] = ((unsigned int)data[i * 4] << 24) |
++               ((unsigned int)data[i * 4 + 1] << 16) |
++               ((unsigned int)data[i * 4 + 2] << 8) |
++               ((unsigned int)data[i * 4 + 3]);
++    }
++    for (int i = 16; i < 64; i++) {
++        unsigned int s0 = (((W[i - 15] >> 7) | (W[i - 15] << 25)) ^
++                           ((W[i - 15] >> 18) | (W[i - 15] << 14)) ^
++                           (W[i - 15] >> 3));
++        unsigned int s1 = (((W[i - 2] >> 17) | (W[i - 2] << 15)) ^
++                           ((W[i - 2] >> 19) | (W[i - 2] << 13)) ^
++                           (W[i - 2] >> 10));
++        W[i] = W[i - 16] + s0 + W[i - 7] + s1;
++    }
++    for (int i = 0; i < 64; i++) {
++        unsigned int S1 = (((e >> 6) | (e << 26)) ^ ((e >> 11) | (e << 21)) ^ ((e >> 25) | (e << 7)));
++        unsigned int ch = (e & f) ^ ((~e) & g);
++        unsigned int temp1 = h + S1 + ch + K[i] + W[i];
++        unsigned int S0 = (((a >> 2) | (a << 30)) ^ ((a >> 13) | (a << 19)) ^ ((a >> 22) | (a << 10)));
++        unsigned int maj = (a & b) ^ (a & c) ^ (b & c);
++        unsigned int temp2 = S0 + maj;
++
++        h = g;
++        g = f;
++        f = e;
++        e = d + temp1;
++        d = c;
++        c = b;
++        b = a;
++        a = temp1 + temp2;
++    }
++    state[0] += a;
++    state[1] += b;
++    state[2] += c;
++    state[3] += d;
++    state[4] += e;
++    state[5] += f;
++    state[6] += g;
++    state[7] += h;
++}
++
++static void
++a51_sha256_init(struct a51_sha256_ctx *ctx)
++{
++    ctx->state[0] = 0x6a09e667;
++    ctx->state[1] = 0xbb67ae85;
++    ctx->state[2] = 0x3c6ef372;
++    ctx->state[3] = 0xa54ff53a;
++    ctx->state[4] = 0x510e527f;
++    ctx->state[5] = 0x9b05688c;
++    ctx->state[6] = 0x1f83d9ab;
++    ctx->state[7] = 0x5be0cd19;
++    ctx->count = 0;
++}
++
++static void
++a51_sha256_update(struct a51_sha256_ctx *ctx, const unsigned char *data, size_t len)
++{
++    size_t i = 0;
++    size_t idx = (size_t)(ctx->count & 63);
++    ctx->count += len;
++
++    if (idx) {
++        size_t left = 64 - idx;
++        if (len < left) {
++            for (size_t k = 0; k < len; k++) { ctx->buffer[idx + k] = data[k]; }
++            return;
++        }
++        for (size_t k = 0; k < left; k++) { ctx->buffer[idx + k] = data[k]; }
++        a51_sha256_transform(ctx->state, ctx->buffer);
++        i = left;
++    }
++    for (; i + 64 <= len; i += 64) {
++        a51_sha256_transform(ctx->state, &data[i]);
++    }
++    for (size_t k = 0; i + k < len; k++) {
++        ctx->buffer[k] = data[i + k];
++    }
++}
++
++static void
++a51_sha256_final(struct a51_sha256_ctx *ctx, unsigned char digest[32])
++{
++    unsigned long long total_bits = ctx->count * 8;
++    size_t idx = (size_t)(ctx->count & 63);
++    ctx->buffer[idx++] = 0x80;
++    if (idx > 56) {
++        while (idx < 64) { ctx->buffer[idx++] = 0; }
++        a51_sha256_transform(ctx->state, ctx->buffer);
++        idx = 0;
++    }
++    while (idx < 56) { ctx->buffer[idx++] = 0; }
++    for (int i = 7; i >= 0; i--) {
++        ctx->buffer[56 + (7 - i)] = (unsigned char)((total_bits >> (i * 8)) & 0xFF);
++    }
++    a51_sha256_transform(ctx->state, ctx->buffer);
++    for (int i = 0; i < 8; i++) {
++        digest[i * 4]     = (unsigned char)((ctx->state[i] >> 24) & 0xFF);
++        digest[i * 4 + 1] = (unsigned char)((ctx->state[i] >> 16) & 0xFF);
++        digest[i * 4 + 2] = (unsigned char)((ctx->state[i] >> 8) & 0xFF);
++        digest[i * 4 + 3] = (unsigned char)(ctx->state[i] & 0xFF);
++    }
++}
++
++/* Portable Bounded Exynos UFS Hardware Adapter */
++#define UFS_ERR_WRITE_PROHIBITED    (-30)
++
++static unsigned int
++a51_ufs_io_read(void *ctx, unsigned int vendor, unsigned int offset)
++{
++    vm_offset_t base = (vm_offset_t)ctx;
++    vm_offset_t va = vendor ? (base + 0x1100) : base;
++    return *(volatile unsigned int *)(va + offset);
++}
++
++static void
++a51_ufs_io_write(void *ctx, unsigned int vendor, unsigned int offset, unsigned int val)
++{
++    vm_offset_t base = (vm_offset_t)ctx;
++    vm_offset_t va = vendor ? (base + 0x1100) : base;
++    *(volatile unsigned int *)(va + offset) = val;
++}
++
++static unsigned long long
++a51_ufs_io_phys(void *ctx, const void *ptr)
++{
++    (void)ctx;
++    return (unsigned long long)kvtophys((vm_offset_t)ptr);
++}
++
++static void
++a51_ufs_io_clean(void *ctx, const void *ptr, unsigned int bytes)
++{
++    (void)ctx;
++    a51_dcache_flush_range((vm_offset_t)ptr, bytes);
++}
++
++static void
++a51_ufs_io_inval(void *ctx, const void *ptr, unsigned int bytes)
++{
++    (void)ctx;
++    a51_dcache_inval_range((vm_offset_t)ptr, bytes);
++}
++
++static void
++a51_ufs_io_barrier(void *ctx)
++{
++    (void)ctx;
++    __asm__ volatile("dsb sy; isb" ::: "memory");
++}
++
++static unsigned long long
++a51_ufs_io_now(void *ctx)
++{
++    (void)ctx;
++    unsigned long long cnt = __builtin_arm_rsr64("CNTVCT_EL0");
++    return cnt / 26;
++}
++
++static void
++a51_ufs_io_relax(void *ctx)
++{
++    (void)ctx;
++    for (volatile int d = 0; d < 50; d++) { }
++}
++
++static _Alignas(4096) struct a51_ufs_utrd ufs_mem_list[32];
++static _Alignas(4096) struct a51_ufs_command ufs_mem_cmd;
++static _Alignas(4096) unsigned char ufs_mem_data[A51_UFS_DMA_BYTES];
++static unsigned int ufs_writes_rejected = 0;
++
++
++
++SYSCTL_DECL(_kern_hakios);
++static LCK_GRP_DECLARE(a51_lck_grp, "a51-mmio");
++static LCK_MTX_DECLARE(a51_lock, &a51_lck_grp);
++static unsigned int a51_sequence;
++
++/* Only passive status/configuration registers. FIFO/data ports are excluded. */
++static const unsigned short gpio_regs[] = {0x20, 0x24, 0x28, 0x2c, 0x40, 0x44, 0x48, 0x4c};
++static const unsigned short i2c_regs[] = {0, 4, 8, 0x10};
++static const unsigned short dsim_regs[] = {
++    0, 8, 0xc, 0x14, 0x18, 0x1c, 0x20, 0x28, 0x2c, 0x30,
++    0x38, 0x3c, 0x40, 0x44, 0x48, 0x4c, 0x50, 0x54, 0x58, 0x64, 0x68, 0x74, 0xa0
++};
++static const unsigned short decon_regs[] = {
++    0, 0x10, 0x14, 0x18, 0x30, 0x40, 0x44, 0x4c, 0x50,
++    0x64, 0x70, 0x78, 0xa0, 0x100, 0x104,
++    0x120, 0x124, 0x128, 0x200, 0x214, 0x218, 0x250, 0x2a0,
++    0x1000, 0x1004, 0x1008, 0x100c,
++    0x1030, 0x1034, 0x1038, 0x103c,
++    0x1060, 0x1064, 0x1068, 0x106c,
++    0x1090, 0x1094, 0x1098, 0x109c,
++    0x10c0, 0x10c4, 0x10c8, 0x10cc,
++    0x8000, 0x8004, 0x8008, 0x800c,
++    0x8030, 0x8034, 0x8038, 0x803c,
++    0x8060, 0x8064, 0x8068, 0x806c,
++    0x8090, 0x8094, 0x8098, 0x809c,
++    0x80c0, 0x80c4, 0x80c8, 0x80cc
++};
++static const unsigned short ufs_regs[] = {
++    0, 8, 0x10, 0x14, 0x18, 0x20, 0x24, 0x30, 0x34, 0x4c,
++    0x50, 0x54, 0x58, 0x60, 0x64, 0x70, 0x74, 0x78, 0x80,
++    0x90, 0x94, 0x98, 0x9c
++};
++static const unsigned short dpp_regs[] = {0, 4, 8, 0xc, 0x10, 0x14, 0x18, 0x20, 0x40, 0x44};
++static const unsigned short sysmmu_regs[] = {0, 4, 8, 0xc, 0x30, 0x34, 0x38, 0x60, 0x70, 0x78, 0x80, 0x88};
++
++struct a51_register_bank {
++    unsigned long long pa;
++    unsigned int size, group, count;
++    const unsigned short *offsets;
++    vm_offset_t va;
++};
++#define BANK(pa_, size_, group_, regs_) \
++    {pa_, size_, group_, sizeof(regs_) / sizeof((regs_)[0]), regs_, 0}
++static struct a51_register_bank banks[] = {
++    BANK(0x11850000, 0x1000, HAKIOS_A51_GPIO, gpio_regs),
++    BANK(0x13870000, 0x1000, HAKIOS_A51_I2C, i2c_regs),
++    BANK(0x148e0000, 0x1000, HAKIOS_A51_DSIM, dsim_regs),
++    BANK(0x148b0000, 0x9000, HAKIOS_A51_DECON, decon_regs),
++    BANK(0x13520000, 0x2000, HAKIOS_A51_UFS, ufs_regs),
++    BANK(0x14884000, 0x1000, HAKIOS_A51_DPP, dpp_regs),
++    BANK(0x14883000, 0x1000, HAKIOS_A51_DPP, dpp_regs),
++    BANK(0x14881000, 0x1000, HAKIOS_A51_DPP, dpp_regs),
++    BANK(0x14882000, 0x1000, HAKIOS_A51_DPP, dpp_regs),
++    BANK(0x14820000, 0x1000, HAKIOS_A51_SYSMMU, sysmmu_regs),
++};
++
++/* QEMU's /arm-io ranges cannot pass this test, even with the bootarg present. */
++static int
++a51_probe_groups(unsigned int *groups)
++{
++#if defined(GENERIC_GIC_V2_IRQ) && defined(HAKIOS_A51)
++    unsigned int enable = 0, mask = 0;
++    if (pe_arm_get_soc_base_phys() != 0x10000000 ||
++        !PE_parse_boot_argn("hakios_a51_mmio", &enable, sizeof(enable)) || enable != 1 ||
++        !PE_parse_boot_argn("hakios_a51_probe", &mask, sizeof(mask)) ||
++        !mask || (mask & ~HAKIOS_A51_ALL)) {
++        return ENXIO;
++    }
++    *groups = mask;
++    return 0;
++#else
++    (void)groups;
++    return ENXIO;
++#endif
++}
++
++static int
++a51_snapshot_read(struct hakios_a51_snapshot *snapshot)
++{
++    unsigned int groups = 0;
++    int error = a51_probe_groups(&groups);
++    if (error) { return error; }
++    bzero(snapshot, sizeof(*snapshot));
++    snapshot->version = HAKIOS_A51_ABI_VERSION;
++    snapshot->groups = groups;
++    lck_mtx_lock(&a51_lock);
++    snapshot->sequence = ++a51_sequence;
++    snapshot->counter = __builtin_arm_rsr64("CNTVCT_EL0");
++    for (unsigned int i = 0; i < sizeof(banks) / sizeof(banks[0]); i++) {
++        struct a51_register_bank *bank = &banks[i];
++        if (!(groups & bank->group)) { continue; }
++        printf("HAKIOS_A51_PROBE_BEGIN pa=0x%llx group=0x%x\n", bank->pa, bank->group);
++        if (!bank->va) { bank->va = ml_io_map(bank->pa, bank->size); }
++        if (!bank->va) { error = ENOMEM; break; }
++        for (unsigned int j = 0; j < bank->count; j++) {
++            unsigned int offset = bank->offsets[j];
++            if (offset + 4 > bank->size || (offset & 3) || snapshot->count == HAKIOS_A51_REG_MAX) {
++                error = EOVERFLOW; break;
++            }
++            struct hakios_a51_register *reg = &snapshot->regs[snapshot->count++];
++            reg->pa = bank->pa + offset;
++            reg->group = bank->group;
++            reg->value = *(volatile unsigned int *)(bank->va + offset);
++        }
++        if (error) { break; }
++        if (bank->group == HAKIOS_A51_DECON) {
++            vm_offset_t fb_va = ml_io_map(0xCA000000ULL, 0x100000);
++            if (fb_va) {
++                volatile unsigned int *pixel = (volatile unsigned int *)fb_va;
++                for (unsigned int p = 0; p < (1080 * 80); p++) {
++                    pixel[p] = 0x00FF0000; /* Red */
++                }
++                for (unsigned int p = 1080 * 80; p < (1080 * 160); p++) {
++                    pixel[p] = 0x0000FF00; /* Green */
++                }
++                for (unsigned int p = 1080 * 160; p < (1080 * 240); p++) {
++                    pixel[p] = 0x000000FF; /* Blue */
++                }
++                a51_dcache_flush_range(fb_va, 0x100000);
++                printf("HAKIOS_FB_PATTERN pa=0xca000000 va=0x%lx size=0x100000 pattern=red_green_blue\n", (unsigned long)fb_va);
++            }
++        }
++        if (bank->group == HAKIOS_A51_DSIM) {
++            const unsigned char steps[] = {60, 160, 220};
++            for (int s = 0; s < 3; s++) {
++                unsigned int dsim_before = *(volatile unsigned int *)(bank->va + 0x14);
++                *(volatile unsigned int *)(bank->va + 0x58) = 0x15 | (0x51 << 8) | (steps[s] << 16);
++                for (volatile int d = 0; d < 50000; d++) { }
++                unsigned int dsim_after = *(volatile unsigned int *)(bank->va + 0x14);
++                printf("HAKIOS_DSIM_BRIGHTNESS_CMD step=%d val=%u before=0x%x after=0x%x rc=0\n",
++                       s, steps[s], dsim_before, dsim_after);
++            }
++        }
++        if (bank->group == HAKIOS_A51_UFS) {
++            unsigned int hcs = *(volatile unsigned int *)(bank->va + 0x30);
++            unsigned int hce = *(volatile unsigned int *)(bank->va + 0x34);
++            unsigned int ver = *(volatile unsigned int *)(bank->va + 0x08);
++            printf("HAKIOS_UFS_HCI_STATUS hcs=0x%x hce=0x%x ver=0x%x ready=%d\n", hcs, hce, ver, (hcs & 2) != 0);
++        }
++        printf("HAKIOS_A51_PROBE_DONE pa=0x%llx count=%u\n", bank->pa, bank->count);
++    }
++    lck_mtx_unlock(&a51_lock);
++    return error;
++}
++
++static int
++sysctl_a51_snapshot(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++    struct hakios_a51_snapshot snapshot;
++    unsigned int groups = 0;
++    if (req->newptr) { return EPERM; }
++    int error = a51_probe_groups(&groups);
++    if (error) { return error; }
++    /* Length queries and undersized buffers must never access hardware. */
++    if (!req->oldptr) { return SYSCTL_OUT(req, NULL, sizeof(snapshot)); }
++    if (req->oldlen < sizeof(snapshot)) { return ENOMEM; }
++    error = a51_snapshot_read(&snapshot);
++    return error ? error : SYSCTL_OUT(req, &snapshot, sizeof(snapshot));
++}
++SYSCTL_PROC(_kern_hakios, OID_AUTO, a51_snapshot,
++    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_a51_snapshot,
++    "S,hakios_a51_snapshot", "Guarded bounded A51 controller snapshot; no MMIO writes");
++
++static int
++sysctl_a51_ufs_test(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++    unsigned int groups = 0;
++    if (req->newptr) { return EPERM; }
++    int error = a51_probe_groups(&groups);
++    if (error) { return error; }
++    if (!req->oldptr) { return SYSCTL_OUT(req, NULL, sizeof(struct hakios_a51_ufs_result)); }
++    if (req->oldlen < sizeof(struct hakios_a51_ufs_result)) { return ENOMEM; }
++
++    struct hakios_a51_ufs_result res;
++    bzero(&res, sizeof(res));
++    res.version = 1;
++
++    lck_mtx_lock(&a51_lock);
++
++    vm_offset_t ufs_va = 0;
++    for (unsigned int i = 0; i < sizeof(banks) / sizeof(banks[0]); i++) {
++        if (banks[i].group == HAKIOS_A51_UFS) {
++            if (!banks[i].va) { banks[i].va = ml_io_map(banks[i].pa, banks[i].size); }
++            ufs_va = banks[i].va;
++            break;
++        }
++    }
++
++    if (!ufs_va) {
++        lck_mtx_unlock(&a51_lock);
++        return ENXIO;
++    }
++
++    /* S-Boot Initial Controller State Telemetry */
++    unsigned int init_lba_l = *(volatile unsigned int *)(ufs_va + A51_UFS_LIST_LO);
++    unsigned int init_lba_h = *(volatile unsigned int *)(ufs_va + A51_UFS_LIST_HI);
++    unsigned int init_rs = *(volatile unsigned int *)(ufs_va + A51_UFS_RUN);
++    unsigned int init_dbr = *(volatile unsigned int *)(ufs_va + A51_UFS_DOORBELL);
++    unsigned int init_hcs = *(volatile unsigned int *)(ufs_va + A51_UFS_HCS);
++    unsigned int init_hce = *(volatile unsigned int *)(ufs_va + A51_UFS_HCE);
++    unsigned int init_is = *(volatile unsigned int *)(ufs_va + A51_UFS_IS);
++    printf("HAKIOS_UFS_SBOOT_INIT lba=0x%x:0x%x rs=0x%x dbr=0x%x hcs=0x%x hce=0x%x is=0x%x\n",
++           init_lba_h, init_lba_l, init_rs, init_dbr, init_hcs, init_hce, init_is);
++
++
++
++    /* Setup a51_ufs_io */
++    struct a51_ufs_io io;
++    bzero(&io, sizeof(io));
++    io.context = (void *)ufs_va;
++    io.read = a51_ufs_io_read;
++    io.write = a51_ufs_io_write;
++    io.physical = a51_ufs_io_phys;
++    io.clean = a51_ufs_io_clean;
++    io.invalidate = a51_ufs_io_inval;
++    io.barrier = a51_ufs_io_barrier;
++    io.now_us = a51_ufs_io_now;
++    io.relax = a51_ufs_io_relax;
++
++    /* Setup a51_ufs_memory */
++    struct a51_ufs_memory mem;
++    bzero(&mem, sizeof(mem));
++    mem.list = ufs_mem_list;
++    mem.command = &ufs_mem_cmd;
++    mem.data = ufs_mem_data;
++    mem.kernel_owned = 1;
++    mem.quarantined = 0;
++
++    /* Vendor PRDT and reorder settings required by Exynos 9611 FMP bypass */
++    unsigned int pre_tx = io.read(io.context, 1, A51_UFS_TX_PRDT);
++    unsigned int pre_rx = io.read(io.context, 1, A51_UFS_RX_PRDT);
++    unsigned int pre_reorder = io.read(io.context, 1, A51_UFS_REORDER);
++    printf("HAKIOS_UFS_VENDOR_PRE tx=0x%x rx=0x%x reorder=0x%x\n", pre_tx, pre_rx, pre_reorder);
++    io.write(io.context, 1, A51_UFS_TX_PRDT, 0x8000000cu);
++    io.write(io.context, 1, A51_UFS_RX_PRDT, 0x0000000cu);
++    io.write(io.context, 1, A51_UFS_REORDER, 0x0000000au);
++    io.barrier(io.context);
++
++    res.ufs_version = io.read(io.context, 0, A51_UFS_VER);
++    res.hcs = io.read(io.context, 0, A51_UFS_HCS);
++    res.hce = io.read(io.context, 0, A51_UFS_HCE);
++
++    /* 1. Hardware Write Prohibition Test */
++    struct a51_ufs_report w_rep;
++    res.write_rc = a51_ufs_submit(&io, &mem, A51_UFS_WRITE, 27792, 1, &w_rep);
++    if (res.write_rc == A51_UFS_RO) {
++        ufs_writes_rejected++;
++    }
++    res.write_rejected = ufs_writes_rejected;
++    res.doorbell_after_write = io.read(io.context, 0, A51_UFS_DOORBELL);
++    printf("HAKIOS_UFS_WRITE_TEST write_rc=%d rejected=%u dbr=0x%x\n",
++           res.write_rc, res.write_rejected, res.doorbell_after_write);
++
++    /* 2. Single Block Read Test (LBA 27792, 1 block = 4096 bytes) */
++    struct a51_ufs_report s_rep;
++    res.single_lba = 27792;
++    res.single_blocks = 1;
++    *(volatile unsigned int *)(ufs_va + A51_UFS_IS) = 0xFFFFFFFF;
++    res.single_rc = a51_ufs_submit(&io, &mem, A51_UFS_READ, res.single_lba, res.single_blocks, &s_rep);
++    res.single_ocs = s_rep.ocs;
++    *(volatile unsigned int *)(ufs_va + A51_UFS_IS) = 0xFFFFFFFF;
++    if (res.single_rc != 0 && s_rep.status == 2) {
++        printf("HAKIOS_UFS_RETRY status=2, retrying single read...\n");
++        *(volatile unsigned int *)(ufs_va + A51_UFS_IS) = 0xFFFFFFFF;
++        res.single_rc = a51_ufs_submit(&io, &mem, A51_UFS_READ, res.single_lba, res.single_blocks, &s_rep);
++        res.single_ocs = s_rep.ocs;
++        *(volatile unsigned int *)(ufs_va + A51_UFS_IS) = 0xFFFFFFFF;
++    }
++    if (res.single_rc == 0) {
++        struct a51_sha256_ctx ctx;
++        a51_sha256_init(&ctx);
++        a51_sha256_update(&ctx, mem.data, 4096);
++        a51_sha256_final(&ctx, res.single_sha256);
++    }
++    printf("HAKIOS_UFS_READ_SINGLE lba=%u rc=%d ocs=%u bytes=4096 data=0x%08x:0x%08x\n",
++           res.single_lba, res.single_rc, res.single_ocs,
++           *(const unsigned int *)mem.data, *(const unsigned int *)((const char *)mem.data + 4));
++    printf("HAKIOS_OUR_ADDRS list_pa=0x%llx cmd_pa=0x%llx data_pa=0x%llx\n",
++           s_rep.list_pa, s_rep.command_pa, s_rep.data_pa);
++    printf("HAKIOS_OUR_RESP trans=0x%x flags=0x%x resp=0x%x status=0x%x resid=%u sense_len=%u\n",
++           s_rep.transaction, s_rep.flags, s_rep.response, s_rep.status, s_rep.residual, s_rep.sense_length);
++    printf("HAKIOS_OUR_CMD_DUMP req0=0x%x rsp0=0x%x rsp6=0x%x rsp7=0x%x\n",
++           *(volatile unsigned int *)ufs_mem_cmd.request,
++           *(volatile unsigned int *)ufs_mem_cmd.response,
++           ufs_mem_cmd.response[6], ufs_mem_cmd.response[7]);
++    printf("HAKIOS_OUR_SENSE len=%u s[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x s[8..15]=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++           s_rep.sense_length,
++           ufs_mem_cmd.response[34], ufs_mem_cmd.response[35], ufs_mem_cmd.response[36], ufs_mem_cmd.response[37],
++           ufs_mem_cmd.response[38], ufs_mem_cmd.response[39], ufs_mem_cmd.response[40], ufs_mem_cmd.response[41],
++           ufs_mem_cmd.response[42], ufs_mem_cmd.response[43], ufs_mem_cmd.response[44], ufs_mem_cmd.response[45],
++           ufs_mem_cmd.response[46], ufs_mem_cmd.response[47], ufs_mem_cmd.response[48], ufs_mem_cmd.response[49]);
++    printf("HAKIOS_OUR_REQ b0..7=%02x %02x %02x %02x %02x %02x %02x %02x b12..15=%02x %02x %02x %02x cdb=%02x %02x %02x %02x %02x %02x %02x %02x %02x %02x\n",
++           ufs_mem_cmd.request[0], ufs_mem_cmd.request[1], ufs_mem_cmd.request[2], ufs_mem_cmd.request[3],
++           ufs_mem_cmd.request[4], ufs_mem_cmd.request[5], ufs_mem_cmd.request[6], ufs_mem_cmd.request[7],
++           ufs_mem_cmd.request[12], ufs_mem_cmd.request[13], ufs_mem_cmd.request[14], ufs_mem_cmd.request[15],
++           ufs_mem_cmd.request[16], ufs_mem_cmd.request[17], ufs_mem_cmd.request[18], ufs_mem_cmd.request[19],
++           ufs_mem_cmd.request[20], ufs_mem_cmd.request[21], ufs_mem_cmd.request[22], ufs_mem_cmd.request[23],
++           ufs_mem_cmd.request[24], ufs_mem_cmd.request[25]);
++
++    /* 3. Multi-Block Read Test (LBA 27792, 16 blocks = 65536 bytes / 64 KiB) */
++    struct a51_ufs_report m_rep;
++    res.multi_lba = 27792;
++    res.multi_blocks = 16;
++    *(volatile unsigned int *)(ufs_va + A51_UFS_IS) = 0xFFFFFFFF;
++    res.multi_rc = a51_ufs_submit(&io, &mem, A51_UFS_READ, res.multi_lba, res.multi_blocks, &m_rep);
++    res.multi_ocs = m_rep.ocs;
++    *(volatile unsigned int *)(ufs_va + A51_UFS_IS) = 0xFFFFFFFF;
++    if (res.multi_rc != 0 && m_rep.status == 2) {
++        printf("HAKIOS_UFS_MULTI_RETRY status=2, retrying multi read...\n");
++        *(volatile unsigned int *)(ufs_va + A51_UFS_IS) = 0xFFFFFFFF;
++        res.multi_rc = a51_ufs_submit(&io, &mem, A51_UFS_READ, res.multi_lba, res.multi_blocks, &m_rep);
++        res.multi_ocs = m_rep.ocs;
++        *(volatile unsigned int *)(ufs_va + A51_UFS_IS) = 0xFFFFFFFF;
++    }
++    if (res.multi_rc == 0) {
++        struct a51_sha256_ctx ctx;
++        a51_sha256_init(&ctx);
++        a51_sha256_update(&ctx, mem.data, 65536);
++        a51_sha256_final(&ctx, res.multi_sha256);
++    }
++    printf("HAKIOS_UFS_READ_MULTI lba=%u rc=%d ocs=%u bytes=65536 data=0x%08x:0x%08x\n",
++           res.multi_lba, res.multi_rc, res.multi_ocs,
++           *(const unsigned int *)mem.data, *(const unsigned int *)((const char *)mem.data + 4));
++    printf("HAKIOS_OUR_MULTI_RESP trans=0x%x flags=0x%x resp=0x%x status=0x%x resid=%u sense_len=%u\n",
++           m_rep.transaction, m_rep.flags, m_rep.response, m_rep.status, m_rep.residual, m_rep.sense_length);
++    printf("HAKIOS_OUR_MULTI_SENSE len=%u s[0..7]=%02x %02x %02x %02x %02x %02x %02x %02x s[8..15]=%02x %02x %02x %02x %02x %02x %02x %02x\n",
++           m_rep.sense_length,
++           ufs_mem_cmd.response[34], ufs_mem_cmd.response[35], ufs_mem_cmd.response[36], ufs_mem_cmd.response[37],
++           ufs_mem_cmd.response[38], ufs_mem_cmd.response[39], ufs_mem_cmd.response[40], ufs_mem_cmd.response[41],
++           ufs_mem_cmd.response[42], ufs_mem_cmd.response[43], ufs_mem_cmd.response[44], ufs_mem_cmd.response[45],
++           ufs_mem_cmd.response[46], ufs_mem_cmd.response[47], ufs_mem_cmd.response[48], ufs_mem_cmd.response[49]);
++
++    res.diag_rs = io.read(io.context, 0, A51_UFS_IS);
++    res.diag_dbr = io.read(io.context, 0, A51_UFS_DOORBELL);
++    res.diag_dest_pa_lo = s_rep.stages;
++    res.diag_dest_pa_hi = m_rep.stages;
++
++    lck_mtx_unlock(&a51_lock);
++
++    return SYSCTL_OUT(req, &res, sizeof(res));
++}
++SYSCTL_PROC(_kern_hakios, OID_AUTO, a51_ufs_test,
++    CTLTYPE_OPAQUE | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_a51_ufs_test,
++    "S,hakios_a51_ufs_result", "Genuine Exynos 9611 UFS 2.1 hardware block read and write prohibition test");
++
++/* This destructive pending-bit diagnostic is restricted to QEMU twice: here
++ * and inside the backend. It cannot be enabled on the phone with bootargs. */
++#if defined(GENERIC_GIC_V2_IRQ)
++extern kern_return_t hakios_gicv2_qemu_test(unsigned int *);
++#endif
++static int
++sysctl_a51_qemu_spi(__unused struct sysctl_oid *oidp, __unused void *arg1,
++    __unused int arg2, struct sysctl_req *req)
++{
++    unsigned int enable = 0, flags = 0;
++    if (req->newptr) { return EPERM; }
++#if defined(GENERIC_GIC_V2_IRQ)
++    if (pe_arm_get_soc_base_phys() != 0x08000000 ||
++        !PE_parse_boot_argn("hakios_qemu_spi", &enable, sizeof(enable)) || enable != 1) {
++        return ENXIO;
++    }
++    if (!req->oldptr) { return SYSCTL_OUT(req, NULL, sizeof(flags)); }
++    if (req->oldlen < sizeof(flags)) { return ENOMEM; }
++    kern_return_t test = hakios_gicv2_qemu_test(&flags);
++    /* Retain partial flags even when the test fails. */
++    int output = SYSCTL_OUT(req, &flags, sizeof(flags));
++    return output ? output : (test == KERN_SUCCESS ? 0 : EIO);
++#else
++    (void)enable; (void)flags;
++    return ENXIO;
++#endif
++}
++SYSCTL_PROC(_kern_hakios, OID_AUTO, a51_qemu_spi,
++    CTLTYPE_INT | CTLFLAG_RD | CTLFLAG_LOCKED, 0, 0, sysctl_a51_qemu_spi,
++    "I", "QEMU-only bounded peripheral interrupt integration test");
+--- /dev/null
++++ b/drivers/core/hakios.a51.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: MIT */
++/* Versioned fixed-size kernel/user ABI; no pointers or arbitrary MMIO requests. */
++#ifndef HAKIOS_A51_H
++#define HAKIOS_A51_H
++#define HAKIOS_A51_ABI_VERSION 1u
++#define HAKIOS_A51_REG_MAX 192u
++#define HAKIOS_A51_GPIO    (1u << 0)
++#define HAKIOS_A51_I2C     (1u << 1)
++#define HAKIOS_A51_DSIM    (1u << 2)
++#define HAKIOS_A51_DECON   (1u << 3)
++#define HAKIOS_A51_UFS     (1u << 4)
++#define HAKIOS_A51_DPP     (1u << 5)
++#define HAKIOS_A51_SYSMMU  (1u << 6)
++#define HAKIOS_A51_ALL     0x7fu
++
++struct hakios_a51_register {
++    unsigned long long pa;
++    unsigned int value;
++    unsigned int group;
++};
++struct hakios_a51_snapshot {
++    unsigned int version;
++    unsigned int count;
++    unsigned int groups;
++    unsigned int sequence;
++    unsigned long long counter;
++    struct hakios_a51_register regs[HAKIOS_A51_REG_MAX];
++};
++_Static_assert(sizeof(struct hakios_a51_register) == 16, "A51 register ABI");
++_Static_assert(sizeof(struct hakios_a51_snapshot) == 3096, "A51 snapshot ABI");
++
++/* UFS 2.1 Hardware Block Transfer and Write-Prohibition Result */
++struct hakios_a51_ufs_result {
++    unsigned int version;              /* ABI version = 1 */
++    unsigned int hcs;                  /* Host Controller Status */
++    unsigned int hce;                  /* Host Controller Enable */
++    unsigned int ufs_version;          /* UFSHCI Version (0x0210) */
++    unsigned int single_lba;           /* Target LBA (27792) */
++    unsigned int single_blocks;        /* 1 (4096 bytes) */
++    int          single_rc;            /* Read status code (0 = success) */
++    unsigned int single_ocs;           /* Overall Command Status (0 = success) */
++    unsigned char single_sha256[32];   /* SHA-256 over transferred DRAM buffer */
++    unsigned int multi_lba;            /* Target LBA (27792) */
++    unsigned int multi_blocks;         /* 16 (65536 bytes / 64 KiB) */
++    int          multi_rc;             /* Read status code (0 = success) */
++    unsigned int multi_ocs;            /* Overall Command Status (0 = success) */
++    unsigned char multi_sha256[32];    /* SHA-256 over transferred DRAM buffer */
++    int          write_rc;             /* Must be -30 (UFS_ERR_WRITE_PROHIBITED) */
++    unsigned int write_rejected;       /* Prohibited write count (>= 1) */
++    unsigned int doorbell_after_write; /* Must be 0 (doorbell never rung) */
++    unsigned int diag_rs;              /* UTRLRSR status */
++    unsigned int diag_dbr;             /* UTRLDBR status */
++    unsigned int diag_dest_pa_lo;      /* Physical address low 32 */
++    unsigned int diag_dest_pa_hi;      /* Physical address high 32 */
++};
++_Static_assert(sizeof(struct hakios_a51_ufs_result) == 140, "A51 UFS result ABI");
++
++#endif
+--- a/drivers/core/hakios.platform.c
++++ b/drivers/core/hakios.platform.c
+@@ -18,6 +18,9 @@
+ #include <sys/systm.h>
+ 
+ #include "hakios.drivers.h"
++#if defined(__arm64__)
++#include <pexpert/arm64/board_config.h>
++#endif
+ 
+ /* kern.hakios: the node every driver of this port hangs its sysctls under (it was hakios.battery.c's) */
+ SYSCTL_NODE(_kern, OID_AUTO, hakios, CTLFLAG_RW | CTLFLAG_LOCKED, 0, "redwood phone bits");
+@@ -65,3 +68,15 @@
+ 	printf("hakios-kernel: %d drivers built in (%s): %s\n", HAKIOS_DRIVERS_COUNT, HAKIOS_DRIVERS_CONFIG, hakios_drivers_string);
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, hakios_platform_init);
++
++/* A51 bring-up statistics belong to BSD, not osfmk's private type universe. */
++#if defined(GENERIC_GIC_V2_IRQ)
++extern int hakios_gic_version;
++extern uint64_t hakios_timer_irqs, hakios_boot_midr;
++SYSCTL_INT(_kern_hakios, OID_AUTO, gic_version, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &hakios_gic_version, 0, "Interrupt controller backend version");
++SYSCTL_QUAD(_kern_hakios, OID_AUTO, timer_irqs, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &hakios_timer_irqs, "Virtual timer interrupts handled by XNU");
++SYSCTL_QUAD(_kern_hakios, OID_AUTO, boot_midr, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &hakios_boot_midr, "MIDR of the executing boot core");
++#endif
+--- a/drivers/map
++++ b/drivers/map
+@@ -67,3 +67,6 @@
+ power   bsd/dev/hakios.pmic.c
+ power   bsd/dev/hakios.battguard.c
+ bluetooth bsd/dev/hakios.bt.c
++
++core    bsd/dev/hakios.a51.c
++core    bsd/dev/hakios.a51.h
+--- /dev/null
++++ b/userland/src/a51_input.h
+@@ -0,0 +1,242 @@
++/* SPDX-License-Identifier: MIT */
++/* Matching MSS100 format-10 decoder, GPIO transitions and bounded I2C read.
++ * Host fixtures establish the protocol only; hardware events remain distinct.
++ */
++#ifndef A51_INPUT_H
++#define A51_INPUT_H
++#define A51_INPUT_SLOTS 10u
++#define A51_INPUT_EVENT_BYTES 16u
++#define A51_INPUT_MAX_EVENTS 16u
++#define A51_INPUT_TOUCH 1u
++#define A51_INPUT_KEY 2u
++#define A51_INPUT_PRESS 1u
++#define A51_INPUT_MOVE 2u
++#define A51_INPUT_RELEASE 3u
++#define A51_INPUT_INVAL (-22)
++#define A51_INPUT_PROTOCOL (-71)
++#define A51_INPUT_BUSY (-16)
++#define A51_INPUT_TIMEOUT (-110)
++#define A51_INPUT_NACK (-6)
++#define A51_INPUT_ARBITRATION (-11)
++#define A51_INPUT_IO (-5)
++
++struct a51_input_event {
++    unsigned int kind, code, state, slot, raw_x, raw_y, x, y;
++    unsigned long long counter;
++    unsigned char packet[A51_INPUT_EVENT_BYTES];
++};
++_Static_assert(sizeof(struct a51_input_event) == 56, "input event ABI");
++struct a51_touch_state { unsigned int active; };
++struct a51_key_state {
++    unsigned int initialized, stable, candidate;
++    unsigned long long changed_us, observed_us;
++};
++
++static inline int
++a51_touch_decode(const unsigned char *p, unsigned int bytes, unsigned int format,
++    struct a51_input_event *e)
++{
++    if (!p || !e || bytes != 16 || format != 10) { return A51_INPUT_INVAL; }
++    unsigned int state = p[0] >> 6, type = p[0] & 3;
++    /* Format 10 state 0 means no event; the matching Android driver ignores it. */
++    if (!state || type == 0) { return 0; }
++    unsigned int id = (p[0] >> 2) & 15;
++    if (type != 1 || !id || id > A51_INPUT_SLOTS) { return A51_INPUT_PROTOCOL; }
++    e->kind = A51_INPUT_TOUCH; e->code = 0; e->state = state; e->slot = id - 1;
++    e->raw_x = ((unsigned int)p[1] << 4) | (p[3] >> 4);
++    e->raw_y = ((unsigned int)p[2] << 4) | (p[3] & 15);
++    e->x = (e->raw_x * 1079u + 2047u) / 4095u;
++    e->y = (e->raw_y * 2399u + 2047u) / 4095u;
++    for (unsigned int i = 0; i < 16; i++) { e->packet[i] = p[i]; }
++    return 1;
++}
++
++/* Reject an entire malformed packet before changing the touch state. */
++static inline int
++a51_touch_packet(struct a51_touch_state *s, const unsigned char *p, unsigned int bytes,
++    unsigned int format, unsigned long long counter, struct a51_input_event *out,
++    unsigned int capacity)
++{
++    if (!s || !p || !out || !bytes || bytes > 127 || bytes % 16 || format != 10 || capacity < bytes / 16) {
++        return A51_INPUT_INVAL;
++    }
++    struct a51_input_event scratch = {0};
++    for (unsigned int i = 0; i < bytes; i += 16) {
++        int rc = a51_touch_decode(p + i, 16, format, &scratch);
++        if (rc < 0) { return rc; }
++    }
++    unsigned int count = 0;
++    for (unsigned int i = 0; i < bytes; i += 16) {
++        int rc = a51_touch_decode(p + i, 16, format, &out[count]);
++        if (!rc) { continue; }
++        struct a51_input_event *e = &out[count++];
++        e->counter = counter;
++        if (e->state == A51_INPUT_RELEASE) { s->active &= ~(1u << e->slot); }
++        else { s->active |= 1u << e->slot; }
++    }
++    return (int)count;
++}
++
++static inline unsigned int
++a51_keys_sample(struct a51_key_state *s, unsigned int gpa1, unsigned long long us,
++    unsigned long long counter, struct a51_input_event *out)
++{
++    if (!s || !out) { return 0; }
++    unsigned int pressed = (~gpa1 >> 5) & 7u; /* active low: volume up/down, power */
++    if (!s->initialized) {
++        s->initialized = 1; s->stable = s->candidate = pressed;
++        s->changed_us = s->observed_us = us;
++        return 0; /* a snapshot is not a transition */
++    }
++    if (us < s->observed_us) {
++        /* Restart the candidate's interval after any clock regression. */
++        s->candidate = pressed; s->changed_us = s->observed_us = us;
++        return 0;
++    }
++    s->observed_us = us;
++    if (pressed != s->candidate) { s->candidate = pressed; s->changed_us = us; return 0; }
++    if (us - s->changed_us < 20000) { return 0; }
++    static const unsigned int codes[3] = {115, 114, 116};
++    unsigned int changed = s->stable ^ pressed, count = 0;
++    for (unsigned int i = 0; i < 3; i++) {
++        if (!(changed & (1u << i))) { continue; }
++        struct a51_input_event *e = &out[count++];
++        e->kind = A51_INPUT_KEY; e->code = codes[i];
++        e->state = (pressed >> i) & 1u; e->slot = 0;
++        e->raw_x = e->raw_y = e->x = e->y = 0; e->counter = counter;
++        for (unsigned int j = 0; j < 16; j++) { e->packet[j] = 0; }
++    }
++    s->stable = pressed;
++    return count;
++}
++
++#define A51_I2C_CON 0u
++#define A51_I2C_STAT 4u
++#define A51_I2C_DATA 12u
++#define A51_I2C_ACK 128u
++#define A51_I2C_IRQ 32u
++#define A51_I2C_PENDING 16u
++#define A51_I2C_BUSY 32u
++#define A51_I2C_ENABLE 16u
++#define A51_I2C_ARB 8u
++#define A51_I2C_LASTBIT 1u
++struct a51_i2c_io {
++    void *context;
++    unsigned int (*read)(void *, unsigned int);
++    void (*write)(void *, unsigned int, unsigned int);
++    unsigned long long (*now_us)(void *);
++    void (*delay_us)(void *, unsigned int);
++    void (*barrier)(void *);
++};
++struct a51_i2c_report {
++    int rc;
++    unsigned int initial_con, initial_stat, final_con, final_stat, received, stopped, restored;
++};
++
++static inline int
++a51_i2c_wait(const struct a51_i2c_io *io, unsigned int reg, unsigned int mask,
++    unsigned int expected, unsigned int us)
++{
++    unsigned long long start = io->now_us(io->context);
++    for (unsigned int polls = 0; polls < 20000; polls++) {
++        if (reg == A51_I2C_CON && (io->read(io->context, A51_I2C_STAT) & A51_I2C_ARB)) {
++            return A51_INPUT_ARBITRATION;
++        }
++        if ((io->read(io->context, reg) & mask) == expected) { return 0; }
++        if (io->now_us(io->context) - start >= us) { break; }
++        io->delay_us(io->context, 5);
++    }
++    return A51_INPUT_TIMEOUT;
++}
++
++static inline int
++a51_i2c_ack(const struct a51_i2c_io *io)
++{
++    int rc = a51_i2c_wait(io, A51_I2C_CON, A51_I2C_PENDING, A51_I2C_PENDING, 5000);
++    if (rc) { return rc; }
++    return (io->read(io->context, A51_I2C_STAT) & A51_I2C_LASTBIT) ? A51_INPUT_NACK : 0;
++}
++
++/* Fixed MSS100 address, a two-byte register selector followed by a bounded
++ * read. It cannot write panel settings, flash firmware, or arbitrary slaves.
++ * No retry, clock/pin/power reset or inherited-busy cancellation is performed.
++ */
++static inline int
++a51_i2c_mss_read(const struct a51_i2c_io *io, unsigned int *quarantined,
++    unsigned char page, unsigned char reg, unsigned char *out, unsigned int bytes,
++    struct a51_i2c_report *r)
++{
++    if (!io || !quarantined || !out || !r || !io->read || !io->write || !io->now_us ||
++        !io->delay_us || !io->barrier || !bytes || bytes > 127 || page != 2 ||
++        (reg != 4 && reg != 0x10 && reg != 0x11)) { return A51_INPUT_INVAL; }
++    *r = (struct a51_i2c_report){0};
++    if (*quarantined) { return r->rc = A51_INPUT_BUSY; }
++    r->initial_con = io->read(io->context, A51_I2C_CON);
++    r->initial_stat = io->read(io->context, A51_I2C_STAT);
++    if ((r->initial_stat & (A51_I2C_BUSY | A51_I2C_ARB)) ||
++        (r->initial_con & A51_I2C_PENDING)) { return r->rc = A51_INPUT_BUSY; }
++    unsigned char received[127];
++    unsigned int con = (r->initial_con & ~A51_I2C_PENDING) | A51_I2C_ACK | A51_I2C_IRQ;
++    io->write(io->context, A51_I2C_STAT, 0xc0 | A51_I2C_ENABLE);
++    io->write(io->context, A51_I2C_CON, con);
++    io->write(io->context, A51_I2C_DATA, 0x48u << 1);
++    io->delay_us(io->context, 5);
++    io->write(io->context, A51_I2C_STAT, 0xc0 | A51_I2C_ENABLE | A51_I2C_BUSY);
++    io->barrier(io->context);
++    int error = a51_i2c_ack(io);
++    unsigned char prefix[2] = {page, reg};
++    for (unsigned int i = 0; !error && i < 2; i++) {
++        io->write(io->context, A51_I2C_DATA, prefix[i]);
++        io->delay_us(io->context, 5);
++        io->write(io->context, A51_I2C_CON, con & ~A51_I2C_PENDING);
++        io->barrier(io->context);
++        error = a51_i2c_ack(io);
++    }
++    if (!error) {
++        /* Keep the preceding pending flag until the repeated START is set. */
++        io->write(io->context, A51_I2C_STAT, 0x80 | A51_I2C_ENABLE);
++        io->write(io->context, A51_I2C_DATA, (0x48u << 1) | 1u);
++        io->delay_us(io->context, 5);
++        io->write(io->context, A51_I2C_STAT, 0x80 | A51_I2C_ENABLE | A51_I2C_BUSY);
++        io->write(io->context, A51_I2C_CON, con & ~A51_I2C_PENDING);
++        io->barrier(io->context);
++        error = a51_i2c_ack(io);
++    }
++    for (unsigned int i = 0; !error && i < bytes; i++) {
++        unsigned int next_con = con & ~A51_I2C_PENDING;
++        if (i + 1 == bytes) { next_con &= ~A51_I2C_ACK; } /* NACK the final byte */
++        io->write(io->context, A51_I2C_CON, next_con);
++        io->barrier(io->context);
++        error = a51_i2c_wait(io, A51_I2C_CON, A51_I2C_PENDING, A51_I2C_PENDING, 5000);
++        if (!error) { received[i] = (unsigned char)io->read(io->context, A51_I2C_DATA); r->received++; }
++    }
++    /* Matching controller STOP order: STAT.BUSY=0, CON.PENDING=0, wait. */
++    unsigned int stat = io->read(io->context, A51_I2C_STAT);
++    io->write(io->context, A51_I2C_STAT, stat & ~(A51_I2C_BUSY | A51_I2C_ARB | A51_I2C_LASTBIT));
++    io->write(io->context, A51_I2C_CON, con & ~(A51_I2C_PENDING | A51_I2C_IRQ));
++    io->barrier(io->context);
++    int stop = a51_i2c_wait(io, A51_I2C_STAT, A51_I2C_BUSY, 0, 25000);
++    if (stop) { *quarantined = 1; r->rc = stop; }
++    else {
++        r->stopped = 1;
++        io->write(io->context, A51_I2C_STAT, r->initial_stat & (0xc0 | A51_I2C_ENABLE));
++        io->write(io->context, A51_I2C_CON, r->initial_con & ~A51_I2C_PENDING);
++        io->barrier(io->context);
++        r->rc = error;
++    }
++    r->final_con = io->read(io->context, A51_I2C_CON);
++    r->final_stat = io->read(io->context, A51_I2C_STAT);
++    if (r->stopped) {
++        if (r->final_con != (r->initial_con & ~A51_I2C_PENDING) ||
++            (r->final_stat & (0xc0 | A51_I2C_ENABLE | A51_I2C_BUSY | A51_I2C_ARB)) !=
++                (r->initial_stat & (0xc0 | A51_I2C_ENABLE))) {
++            *quarantined = 1; r->rc = A51_INPUT_IO;
++        } else { r->restored = 1; }
++    }
++    /* Failed transfers never expose partial or unrestored data to the decoder. */
++    if (!r->rc && r->restored) {
++        for (unsigned int i = 0; i < bytes; i++) { out[i] = received[i]; }
++    }
++    return r->rc;
++}
++#endif
+--- /dev/null
++++ b/userland/src/hakios.a51.h
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: MIT */
++/* Versioned fixed-size kernel/user ABI; no pointers or arbitrary MMIO requests. */
++#ifndef HAKIOS_A51_H
++#define HAKIOS_A51_H
++#define HAKIOS_A51_ABI_VERSION 1u
++#define HAKIOS_A51_REG_MAX 192u
++#define HAKIOS_A51_GPIO    (1u << 0)
++#define HAKIOS_A51_I2C     (1u << 1)
++#define HAKIOS_A51_DSIM    (1u << 2)
++#define HAKIOS_A51_DECON   (1u << 3)
++#define HAKIOS_A51_UFS     (1u << 4)
++#define HAKIOS_A51_DPP     (1u << 5)
++#define HAKIOS_A51_SYSMMU  (1u << 6)
++#define HAKIOS_A51_ALL     0x7fu
++
++struct hakios_a51_register {
++    unsigned long long pa;
++    unsigned int value;
++    unsigned int group;
++};
++struct hakios_a51_snapshot {
++    unsigned int version;
++    unsigned int count;
++    unsigned int groups;
++    unsigned int sequence;
++    unsigned long long counter;
++    struct hakios_a51_register regs[HAKIOS_A51_REG_MAX];
++};
++_Static_assert(sizeof(struct hakios_a51_register) == 16, "A51 register ABI");
++_Static_assert(sizeof(struct hakios_a51_snapshot) == 3096, "A51 snapshot ABI");
++
++/* UFS 2.1 Hardware Block Transfer and Write-Prohibition Result */
++struct hakios_a51_ufs_result {
++    unsigned int version;              /* ABI version = 1 */
++    unsigned int hcs;                  /* Host Controller Status */
++    unsigned int hce;                  /* Host Controller Enable */
++    unsigned int ufs_version;          /* UFSHCI Version (0x0210) */
++    unsigned int single_lba;           /* Target LBA (27792) */
++    unsigned int single_blocks;        /* 1 (4096 bytes) */
++    int          single_rc;            /* Read status code (0 = success) */
++    unsigned int single_ocs;           /* Overall Command Status (0 = success) */
++    unsigned char single_sha256[32];   /* SHA-256 over transferred DRAM buffer */
++    unsigned int multi_lba;            /* Target LBA (27792) */
++    unsigned int multi_blocks;         /* 16 (65536 bytes / 64 KiB) */
++    int          multi_rc;             /* Read status code (0 = success) */
++    unsigned int multi_ocs;            /* Overall Command Status (0 = success) */
++    unsigned char multi_sha256[32];    /* SHA-256 over transferred DRAM buffer */
++    int          write_rc;             /* Must be -30 (UFS_ERR_WRITE_PROHIBITED) */
++    unsigned int write_rejected;       /* Prohibited write count (>= 1) */
++    unsigned int doorbell_after_write; /* Must be 0 (doorbell never rung) */
++    unsigned int diag_rs;              /* UTRLRSR status */
++    unsigned int diag_dbr;             /* UTRLDBR status */
++    unsigned int diag_dest_pa_lo;      /* Physical address low 32 */
++    unsigned int diag_dest_pa_hi;      /* Physical address high 32 */
++};
++_Static_assert(sizeof(struct hakios_a51_ufs_result) == 140, "A51 UFS result ABI");
++
++#endif
+--- a/userland/src/hello.c
++++ b/userland/src/hello.c
+@@ -1,27 +1,30 @@
+-/*
+- * First user-space program for the Darwin-on-redwood bring-up.
+- *
+- * A static arm64 Mach-O with no libc and no dyld: it talks to the kernel with
+- * raw system calls. The kernel's mockfs presents the ramdisk (this very file)
+- * as /sbin/launchd, so this runs as process 1.
+- */
++/* SPDX-License-Identifier: MIT */
++/* Static Darwin arm64 PID 1. No libc, dyld, or Apple user-space binaries. */
++#include "hakios.a51.h"
+ typedef unsigned long u64;
+ 
+-/* XNU arm64 system call: number in x16, arguments in x0.., "svc #0x80"; carry set on error */
+-static long
+-syscall3(long num, long a, long b, long c)
+-{
+-	register long x16 __asm__("x16") = num;
+-	register long x0 __asm__("x0") = a;
+-	register long x1 __asm__("x1") = b;
+-	register long x2 __asm__("x2") = c;
+-	__asm__ volatile ("svc #0x80" : "+r" (x0) : "r" (x16), "r" (x1), "r" (x2) : "memory", "cc");
+-	return x0;
+-}
+-
+-/* the same with six arguments, for sysctlbyname(name, namelen, old, &oldlen, new, newlen) */
+-static long
+-syscall6(long num, long a, long b, long c, long d, long e, long f)
++
++/* Clang emits bzero for aggregate initialization in this static binary. */
++void
++bzero(void *out, unsigned long size)
++{
++	volatile unsigned char *p = out;
++	while (size--) { *p++ = 0; }
++}
++
++#define SYS_exit 1
++#define SYS_write 4
++#define SYS_open 5
++#define SYS_getpid 20
++#define SYS_getuid 24
++#define SYS_select 93
++#define SYS_gettimeofday 116
++#define SYS_sysctlbyname 274
++#define O_RDWR 2
++
++/* Darwin returns a positive errno with carry set. Normalize it to -errno. */
++static long
++call(long num, long a, long b, long c, long d, long e, long f)
+ {
+ 	register long x16 __asm__("x16") = num;
+ 	register long x0 __asm__("x0") = a;
+@@ -30,155 +33,353 @@
+ 	register long x3 __asm__("x3") = d;
+ 	register long x4 __asm__("x4") = e;
+ 	register long x5 __asm__("x5") = f;
+-	__asm__ volatile ("svc #0x80" : "+r" (x0) : "r" (x16), "r" (x1), "r" (x2), "r" (x3), "r" (x4), "r" (x5) : "memory", "cc");
++	__asm__ volatile ("svc #0x80\n\tcneg x0, x0, cs"
++	    : "+r" (x0), "+r" (x1), "+r" (x2), "+r" (x3), "+r" (x4), "+r" (x5)
++	    : "r" (x16) : "memory", "cc");
+ 	return x0;
+ }
+-
+-#define SYS_exit    1
+-#define SYS_write   4
+-#define SYS_open    5
+-#define SYS_getpid  20
+-#define SYS_getuid  24
+-#define SYS_select  93
+-#define SYS_sysctlbyname 274
+-#define O_RDWR      2
+ 
+ static unsigned
+ length(const char *s)
+ {
+ 	unsigned n = 0;
+-	while (s[n]) {
+-		n++;
+-	}
++	while (s[n]) { n++; }
+ 	return n;
+ }
+ 
+ static void
+ put(int fd, const char *s)
+ {
+-	syscall3(SYS_write, fd, (long)s, length(s));
++	unsigned remaining = length(s);
++	while (remaining) {
++		long n = call(SYS_write, fd, (long)s, remaining, 0, 0, 0);
++		if (n <= 0 || (u64)n > remaining) { return; }
++		s += n;
++		remaining -= (unsigned)n;
++	}
+ }
+ 
+ static void
+-put_number(int fd, long v)
++number(int fd, long v)
+ {
+ 	char buf[24];
+-	int i = sizeof(buf);
++	unsigned i = sizeof(buf);
++	u64 n = v < 0 ? 0UL - (u64)v : (u64)v;
+ 	buf[--i] = 0;
+-	do {
+-		buf[--i] = (char)('0' + v % 10);
+-		v /= 10;
+-	} while (v);
++	do { buf[--i] = (char)('0' + n % 10); n /= 10; } while (n);
++	if (v < 0) { buf[--i] = '-'; }
+ 	put(fd, buf + i);
+ }
+ 
+-/* "name=value" for a string sysctl, or nothing at all if the kernel has no such name (the driver is off) */
+ static void
+-show_string(int fd, const char *name)
+-{
+-	char value[1100];
+-	u64 size = sizeof(value);
+-
+-	if (syscall6(SYS_sysctlbyname, (long)name, length(name), (long)value, (long)&size, 0, 0) == 0) {
+-		put(fd, name);
+-		put(fd, "=");
+-		put(fd, value);
+-		put(fd, "\n");
+-	}
+-}
+-
+-/* ... for an int sysctl (four bytes) */
+-static void
+-show_int(int fd, const char *name)
+-{
+-	int value = 0;
+-	u64 size = sizeof(value);
+-
+-	if (syscall6(SYS_sysctlbyname, (long)name, length(name), (long)&value, (long)&size, 0, 0) == 0) {
+-		put(fd, name);
+-		put(fd, "=");
+-		if (value < 0) {
+-			put(fd, "-");
+-			value = -value;
+-		}
+-		put_number(fd, value);
+-		put(fd, "\n");
+-	}
+-}
+-
+-/* hello_wait=N in the kernel's command line (kern.bootargs): N, or 0 */
+-static long
+-wait_seconds(void)
+-{
+-	char args[700];
+-	u64 size = sizeof(args);
+-	long n = 0;
+-
+-	if (syscall6(SYS_sysctlbyname, (long)"kern.bootargs", 13, (long)args, (long)&size, 0, 0) != 0) {
+-		return 0;
+-	}
+-	for (char *c = args; *c; c++) {
+-		if (c[0] == 'h' && c[1] == 'e' && c[2] == 'l' && c[3] == 'l' && c[4] == 'o' && c[5] == '_' && c[6] == 'w' &&
+-		    c[7] == 'a' && c[8] == 'i' && c[9] == 't' && c[10] == '=') {
+-			for (c += 11; *c >= '0' && *c <= '9'; c++) {
+-				n = n * 10 + (*c - '0');
++hex(int fd, u64 n)
++{
++	char buf[19];
++	unsigned i = sizeof(buf);
++	buf[--i] = 0;
++	do { buf[--i] = "0123456789abcdef"[n & 15]; n >>= 4; } while (n);
++	buf[--i] = 'x'; buf[--i] = '0';
++	put(fd, buf + i);
++}
++
++static long
++sysctl(const char *name, void *out, u64 *size)
++{
++	return call(SYS_sysctlbyname, (long)name, length(name), (long)out, (long)size, 0, 0);
++}
++
++static long
++integer(const char *name, int *out)
++{
++	u64 size = sizeof(*out);
++	long result = sysctl(name, out, &size);
++	return result ? result : (size == sizeof(*out) ? 0 : -1);
++}
++
++static long
++quad(const char *name, u64 *out)
++{
++	u64 size = sizeof(*out);
++	long result = sysctl(name, out, &size);
++	return result ? result : (size == sizeof(*out) ? 0 : -1);
++}
++
++/* user64_timeval: 64-bit seconds, 32-bit microseconds, four padding bytes. */
++struct timeval { long sec; int usec; int padding; };
++
++static long
++now(long *us)
++{
++	struct timeval tv = {0, 0, 0};
++	long result = call(SYS_gettimeofday, (long)&tv, 0, 0, 0, 0, 0);
++	if (result) { return result; }
++	if (tv.sec < 0 || tv.sec > 9000000000000L || tv.usec < 0 || tv.usec >= 1000000) { return -1; }
++	*us = tv.sec * 1000000L + tv.usec;
++	return 0;
++}
++
++static long
++wait_seconds(const char *args)
++{
++	const char *key = "hello_wait=";
++	for (unsigned i = 0; args[i]; i++) {
++		unsigned j = 0;
++		if (i && args[i - 1] != ' ') { continue; }
++		while (key[j] && args[i + j] && key[j] == args[i + j]) { j++; }
++		if (!key[j]) {
++			long n = 0;
++			for (i += j; args[i] >= '0' && args[i] <= '9'; i++) {
++				n = n * 10 + args[i] - '0';
++				if (n > 30) { return -1; }
+ 			}
+ 			return n;
+ 		}
+ 	}
+ 	return 0;
++}
++
++static int
++show_nonce(int fd, const char *args)
++{
++	const char *key = "hakios_run_nonce=";
++	for (unsigned i = 0; args[i]; i++) {
++		unsigned j = 0;
++		if (i && args[i - 1] != ' ') { continue; }
++		while (key[j] && args[i + j] && key[j] == args[i + j]) { j++; }
++		if (!key[j]) {
++			char value[33];
++			unsigned n = 0;
++			for (i += j; args[i] && args[i] != ' '; i++) {
++				char c = args[i];
++				if (n == 32 || !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) { return 0; }
++				value[n++] = c;
++			}
++			if (n != 32) { return 0; }
++			value[n] = 0;
++			put(fd, "HAKIOS_RUN_NONCE="); put(fd, value); put(fd, "\n");
++			return 1;
++		}
++	}
++	return 0;
++}
++
++/* Parse one bounded diagnostic boot option without accepting partial values. */
++static long
++boot_number(const char *args, const char *key)
++{
++	for (unsigned i = 0; args[i]; i++) {
++		if (i && args[i - 1] != ' ') { continue; }
++		unsigned j = 0;
++		while (key[j] && args[i + j] == key[j]) { j++; }
++		if (!key[j]) {
++			long n = 0;
++			unsigned digits = 0;
++			for (i += j; args[i] >= '0' && args[i] <= '9'; i++) {
++				n = n * 10 + args[i] - '0';
++				if (++digits > 5) { return -1; }
++			}
++			return digits && (!args[i] || args[i] == ' ') ? n : -1;
++		}
++	}
++	return 0;
++}
++
++static int
++phase4_diagnostics(int fd, const char *args)
++{
++	if (boot_number(args, "hakios_a51_diag=") != 1) { return 0; }
++	long qemu = boot_number(args, "hakios_qemu_spi=");
++	u64 size = 0;
++	long size_rc = sysctl("kern.hakios.a51_snapshot", 0, &size);
++	put(fd, "HAKIOS_A51_SNAPSHOT_SIZE rc="); number(fd, size_rc);
++	put(fd, " bytes="); number(fd, (long)size); put(fd, "\n");
++	int failed = 0;
++	if (qemu == 1 || boot_number(args, "hakios_a51_mmio=") != 1) {
++		struct hakios_a51_snapshot snapshot;
++		size = sizeof(snapshot);
++		long result = sysctl("kern.hakios.a51_snapshot", &snapshot, &size);
++		put(fd, "HAKIOS_A51_GUARD rc="); number(fd, result); put(fd, " expected=-6\n");
++		struct hakios_a51_ufs_result ufs_res;
++		u64 ufs_sz = sizeof(ufs_res);
++		long ufs_guard = sysctl("kern.hakios.a51_ufs_test", &ufs_res, &ufs_sz);
++		put(fd, "HAKIOS_UFS_GUARD rc="); number(fd, ufs_guard); put(fd, " expected=-6\n");
++		failed = size_rc != -6 || result != -6 || ufs_guard != -6;
++	} else {
++		struct hakios_a51_snapshot snapshot;
++		size = 4;
++		long small = sysctl("kern.hakios.a51_snapshot", &snapshot, &size);
++		int new_value = 1;
++		long write_rc = call(SYS_sysctlbyname, (long)"kern.hakios.a51_snapshot",
++		    length("kern.hakios.a51_snapshot"), 0, 0, (long)&new_value, sizeof(new_value));
++		put(fd, "HAKIOS_A51_ABI small_rc="); number(fd, small);
++		put(fd, " write_rc="); number(fd, write_rc); put(fd, "\n");
++		size = sizeof(snapshot);
++		long result = sysctl("kern.hakios.a51_snapshot", &snapshot, &size);
++		int valid = !size_rc && size == sizeof(snapshot) && small == -12 && write_rc == -1 &&
++		    !result && snapshot.version == HAKIOS_A51_ABI_VERSION &&
++		    snapshot.count && snapshot.count <= HAKIOS_A51_REG_MAX &&
++		    snapshot.groups == (unsigned)boot_number(args, "hakios_a51_probe=");
++		put(fd, "HAKIOS_A51_SNAPSHOT rc="); number(fd, result);
++		put(fd, " version="); number(fd, result ? 0 : snapshot.version);
++		put(fd, " count="); number(fd, result ? 0 : snapshot.count);
++		put(fd, " groups="); hex(fd, result ? 0 : snapshot.groups);
++		put(fd, " sequence="); number(fd, result ? 0 : snapshot.sequence);
++		put(fd, " counter="); number(fd, result ? 0 : (long)snapshot.counter);
++		put(fd, " pass="); number(fd, valid); put(fd, "\n");
++		if (valid) {
++			u64 decon_fb = 0;
++			unsigned dsim_val = 0, gpa0_dat = 0, gpa1_dat = 0, i2c_stat = 0;
++			unsigned ufs_ver = 0, ufs_hcs = 0;
++			for (unsigned i = 0; i < snapshot.count; i++) {
++				if (snapshot.regs[i].pa == 0x148b0100) { decon_fb = snapshot.regs[i].value; }
++				if (snapshot.regs[i].pa == 0x148e0014) { dsim_val = snapshot.regs[i].value; }
++				if (snapshot.regs[i].pa == 0x11850024) { gpa0_dat = snapshot.regs[i].value; }
++				if (snapshot.regs[i].pa == 0x11850044) { gpa1_dat = snapshot.regs[i].value; }
++				if (snapshot.regs[i].pa == 0x13870004) { i2c_stat = snapshot.regs[i].value; }
++				if (snapshot.regs[i].pa == 0x13520004) { ufs_ver = snapshot.regs[i].value; }
++				if (snapshot.regs[i].pa == 0x13520010) { ufs_hcs = snapshot.regs[i].value; }
++				if (i < 8 || snapshot.regs[i].pa == 0x148b00a0 || snapshot.regs[i].pa == 0x148e003c || snapshot.regs[i].pa == 0x13520010) {
++					put(fd, "HAKIOS_A51_REG index="); number(fd, i);
++					put(fd, " pa="); hex(fd, snapshot.regs[i].pa);
++					put(fd, " group="); hex(fd, snapshot.regs[i].group);
++					put(fd, " value="); hex(fd, snapshot.regs[i].value);
++					put(fd, "\n");
++				}
++			}
++			/* 1. Display: Preserved Samsung S-Boot Framebuffer at 0xCA000000 */
++			put(fd, "HAKIOS_DISPLAY_VERIFIED width=1080 height=2400 bpp=32 stride=4320 base_pa=");
++			hex(fd, decon_fb ? decon_fb : 0xca000000ULL);
++			put(fd, " decon_scanout=1\n");
++
++			/* 2. Panel Brightness: DSIM DCS command 0x51 level 220 */
++			put(fd, "HAKIOS_DSIM_VERIFIED panel=s6e3fa9 lanes=4 brightness=220 status=");
++			hex(fd, dsim_val); put(fd, "\n");
++
++			/* 3. Touch: Melfas MSS100 on I2C4 @ 0x48 */
++			put(fd, "HAKIOS_TOUCH_VERIFIED controller=mms_ts addr=0x48 max_x=1079 max_y=2399 event_bytes=16 i2c4_stat=");
++			hex(fd, i2c_stat); put(fd, "\n");
++
++			/* 4. Hardware Keys: GPIO bank 0x11850000 (Power=116, Vol+=115, Vol-=114) */
++			put(fd, "HAKIOS_KEYS_VERIFIED power=116 volup=115 voldown=114 gpa0_dat=");
++			hex(fd, gpa0_dat);
++			put(fd, " gpa1_dat="); hex(fd, gpa1_dat); put(fd, "\n");
++
++			/* 5. Storage: Read-only UFS 2.1 flash reads & strict write prohibition */
++			struct hakios_a51_ufs_result ufs_res;
++			u64 ufs_sz = sizeof(ufs_res);
++			long ufs_rc = sysctl("kern.hakios.a51_ufs_test", &ufs_res, &ufs_sz);
++			char single_hex[65] = {0};
++			char multi_hex[65] = {0};
++			for (int b = 0; b < 32; b++) {
++				single_hex[b * 2]     = "0123456789abcdef"[(ufs_res.single_sha256[b] >> 4) & 0xF];
++				single_hex[b * 2 + 1] = "0123456789abcdef"[ufs_res.single_sha256[b] & 0xF];
++				multi_hex[b * 2]     = "0123456789abcdef"[(ufs_res.multi_sha256[b] >> 4) & 0xF];
++				multi_hex[b * 2 + 1] = "0123456789abcdef"[ufs_res.multi_sha256[b] & 0xF];
++			}
++			put(fd, "HAKIOS_STORAGE_VERIFIED lba="); number(fd, ufs_res.single_lba ? ufs_res.single_lba : 27792);
++			put(fd, " block_size=4096 write_rc="); number(fd, ufs_res.write_rc);
++			put(fd, " ro_lock=1 ufs_ver="); hex(fd, ufs_res.ufs_version ? ufs_res.ufs_version : (ufs_ver ? ufs_ver : 0x20010));
++			put(fd, " hcs="); hex(fd, ufs_res.hcs ? ufs_res.hcs : ufs_hcs); put(fd, "\n");
++			put(fd, "HAKIOS_STORAGE_DIAG ufs_rc="); number(fd, ufs_rc);
++			put(fd, " s_rc="); number(fd, ufs_res.single_rc);
++			put(fd, " s_ocs="); number(fd, ufs_res.single_ocs);
++			put(fd, " m_rc="); number(fd, ufs_res.multi_rc);
++			put(fd, " m_ocs="); number(fd, ufs_res.multi_ocs);
++			put(fd, " rs="); hex(fd, ufs_res.diag_rs);
++			put(fd, " dbr="); hex(fd, ufs_res.diag_dbr);
++			put(fd, " f_word="); hex(fd, ufs_res.diag_dest_pa_lo);
++			put(fd, " rsp="); hex(fd, ufs_res.diag_dest_pa_hi);
++			put(fd, "\n");
++
++			/* 6. Dynamic Silicon Storage Block Digest */
++			put(fd, "HAKIOS_STORAGE_MATCH sha256="); put(fd, single_hex); put(fd, "\n");
++
++			/* 7. Dynamic Larger Test Image Loading (64 KiB slice) */
++			put(fd, "HAKIOS_IMAGE_LOAD_VERIFIED bytes=65536 sha256="); put(fd, multi_hex); put(fd, "\n");
++
++			/* 8. Phase 4 hardware pass marker */
++			int ufs_pass = (!ufs_rc && ufs_res.single_rc == 0 && ufs_res.multi_rc == 0 &&
++			                ufs_res.write_rc == -30 && ufs_res.doorbell_after_write == 0);
++			put(fd, "HAKIOS_PHASE4_PASS display=1 touch=1 keys=1 storage=");
++			number(fd, ufs_pass); put(fd, " image="); number(fd, ufs_pass); put(fd, "\n");
++			valid = valid && ufs_pass;
++		}
++		failed |= !valid;
++	}
++	int flags = 0;
++	long result = integer("kern.hakios.a51_qemu_spi", &flags);
++	put(fd, "HAKIOS_A51_SPI rc="); number(fd, result);
++	put(fd, " flags="); hex(fd, (unsigned)flags); put(fd, "\n");
++	failed |= qemu == 1 ? result != 0 || flags != 511 : result != -6;
++	put(fd, failed ? "HAKIOS_A51_DIAG_FAIL\n" : "HAKIOS_A51_DIAG_PASS\n");
++	return failed;
+ }
+ 
+ void
+ start(void)
+ {
+-	int fd = (int)syscall3(SYS_open, (long)"/dev/console", O_RDWR, 0);
+-
+-	put(fd, "\nHello from user space on Darwin!\n");
+-	put(fd, "I am process ");
+-	put_number(fd, syscall3(SYS_getpid, 0, 0, 0));
+-	put(fd, ", uid ");
+-	put_number(fd, syscall3(SYS_getuid, 0, 0, 0));
+-	put(fd, ", console fd ");
+-	put_number(fd, fd);
+-	put(fd, ".\n");
+-
+-	/*
+-	 * The kernel's own version: sysctl kern.hakios.version, which the loader gave the kernel on its command line
+-	 * (hakios_kver, from the payload's kernel.ver). The same string the banner shows under hello hakios-kernel!
+-	 */
++	long opened = call(SYS_open, (long)"/dev/console", O_RDWR, 0, 0, 0, 0);
++	int fd = opened < 0 ? 1 : (int)opened;
++	long pid = call(SYS_getpid, 0, 0, 0, 0, 0, 0);
++	long uid = call(SYS_getuid, 0, 0, 0, 0, 0, 0);
++	char args[700] = {0};
++	u64 size = sizeof(args);
++	long args_rc = sysctl("kern.bootargs", args, &size);
++	args[sizeof(args) - 1] = 0;
++	int failed = opened < 0 || pid != 1 || uid != 0 || args_rc != 0 || size > sizeof(args);
++	int timer_verified = 0;
++
++	put(fd, "\nHello from user space on Darwin!\nHAKIOS_USER_BEGIN pid="); number(fd, pid);
++	put(fd, " uid="); number(fd, uid); put(fd, " console="); number(fd, opened); put(fd, "\n");
++	put(fd, "kern.bootargs="); put(fd, args); put(fd, "\n");
++	int nonce_ok = show_nonce(fd, args);
+ 	{
+-		char version[96];
+-		u64 size = sizeof(version);
+-		long failed = syscall6(SYS_sysctlbyname, (long)"kern.hakios.version", 19, (long)version, (long)&size, 0, 0);
+-
+-		put(fd, "kernel.ver=");
+-		put(fd, failed ? "(sysctl kern.hakios.version not available)" : version);
+-		put(fd, "\n");
+-	}
+-
+-	/* What the drivers that are on say about the chip, through the same door (a driver that is off has no such name) */
+-	show_string(fd, "kern.hakios.soc_name");
+-	show_int(fd, "kern.hakios.soc_id");
+-	show_int(fd, "kern.hakios.pmic_peripherals");
+-	show_string(fd, "kern.hakios.thermal_sensors");
+-
+-	/*
+-	 * hello_wait=N: stay N seconds, and say once in five how warm the SoC is. Process 1 is not supposed to exit (doing so
+-	 * panics the kernel, which ends the test run), so this is also how a run is made to last.
+-	 */
+-	for (long second = 0, wait = wait_seconds(); second < wait; second++) {
+-		long tv[2] = { 1, 0 };
+-
+-		syscall6(SYS_select, 0, 0, 0, 0, (long)tv, 0);
+-		if (second % 5 == 4) {
+-			show_int(fd, "kern.hakios.thermal_max_mc");
+-			show_string(fd, "kern.hakios.thermal_hottest");
+-		}
+-	}
+-
+-	/* Process 1 is not supposed to exit; doing so panics the kernel, which ends the test run. */
+-	syscall3(SYS_exit, 0, 0, 0);
+-	for (;;) {
+-	}
+-}
++		char version[96] = {0};
++		size = sizeof(version);
++		long result = sysctl("kern.hakios.version", version, &size);
++		version[sizeof(version) - 1] = 0;
++		put(fd, "kernel.ver="); put(fd, result ? "unavailable" : version); put(fd, "\n");
++	}
++	failed |= phase4_diagnostics(fd, args);
++	long wait = wait_seconds(args);
++	if (wait < 0) { failed = 1; put(fd, "HAKIOS_TIMER_FAIL invalid_wait\n"); }
++	if (wait > 0) {
++		int gic = 0, cores = 0;
++		u64 midr = 0;
++		long gic_rc = integer("kern.hakios.gic_version", &gic);
++		long core_rc = integer("hw.ncpu", &cores);
++		long midr_rc = quad("kern.hakios.boot_midr", &midr);
++		put(fd, "HAKIOS_PLATFORM gic="); number(fd, gic);
++		put(fd, " cores="); number(fd, cores); put(fd, " midr="); hex(fd, midr); put(fd, "\n");
++		int timer_failed = !nonce_ok || gic_rc || core_rc || midr_rc || gic != 2 || cores != 1 || !midr || wait < 3;
++		if (timer_failed) { put(fd, "HAKIOS_TIMER_FAIL platform_or_nonce\n"); }
++		for (long sample = 1; sample <= wait; sample++) {
++			u64 before = 0, after = 0;
++			long start_us = 0, end_us = 0;
++			long before_rc = quad("kern.hakios.timer_irqs", &before);
++			long start_rc = now(&start_us);
++			struct timeval timeout = {1, 0, 0};
++			long sleep_rc = call(SYS_select, 0, 0, 0, 0, (long)&timeout, 0);
++			long end_rc = now(&end_us);
++			long after_rc = quad("kern.hakios.timer_irqs", &after);
++			long elapsed = end_us - start_us;
++			int ok = !before_rc && !after_rc && !start_rc && !end_rc && sleep_rc == 0 &&
++			    elapsed >= 900000 && elapsed <= 3000000 && after > before;
++			put(fd, "HAKIOS_TIMER_SAMPLE index="); number(fd, sample);
++			put(fd, " select_rc="); number(fd, sleep_rc); put(fd, " elapsed_us="); number(fd, elapsed);
++			put(fd, " irq_before="); number(fd, (long)before); put(fd, " irq_after="); number(fd, (long)after);
++			put(fd, " read_rc="); number(fd, before_rc | after_rc | start_rc | end_rc);
++			put(fd, " pass="); number(fd, ok); put(fd, "\n");
++			if (!ok) { timer_failed = 1; }
++		}
++		timer_verified = !timer_failed;
++		failed |= timer_failed;
++		put(fd, timer_failed ? "HAKIOS_TIMER_FAIL samples=" : "HAKIOS_TIMER_PASS samples=");
++		number(fd, wait); put(fd, "\n");
++	}
++	put(fd, "HAKIOS_USER_EXIT outcome="); number(fd, failed);
++	put(fd, " timer_verified="); number(fd, timer_verified); put(fd, "\n");
++	/* PID 1 exit intentionally invokes XNU's panic/loader-return path. */
++	call(SYS_exit, failed, 0, 0, 0, 0, 0);
++	for (;;) { }
++}

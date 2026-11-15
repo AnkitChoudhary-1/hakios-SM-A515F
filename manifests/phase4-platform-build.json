@@ -1,0 +1,27 @@
+{
+  "root": "/opt/a51-hakios/experimental/phase4-port/20261114T150320411427Z",
+  "packet": "evidence/phase-4/platform-build/20261115T154220836409Z",
+  "build_verified": true,
+  "adaptation_packet": "evidence/phase-4/platform-adaptation/20261114T154338406253Z",
+  "device_operations": false,
+  "phase_4_gate_passed": false,
+  "artifacts": {
+    "hakios-kernel": {
+      "bytes": 15218200,
+      "sha256": "b932f693456777bd07daf0af4c106c25a12e92c0cea5d38f79dd0e4b15f9f58f"
+    },
+    "userland/hello": {
+      "bytes": 16632,
+      "sha256": "0bba06588c760e0c9160c5667cdb625bf4405f38b89231b196c87ccfe4311bfa"
+    },
+    ".config": {
+      "bytes": 11878,
+      "sha256": "3a364a97d6a922cd7fea0859b51392032daa94bfe3219a0cd0859f91588dcf9f"
+    },
+    "xnu-build.log": {
+      "bytes": 119995,
+      "sha256": "a5a04813102c8501b7643934540350a2e7829a91f073ddb0c89c1dcdd46d5e61"
+    }
+  },
+  "parent_unchanged": true
+}

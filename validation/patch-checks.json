@@ -1,0 +1,127 @@
+{
+  "passed": true,
+  "checked_utc": "2026-11-15T15:44:55.925949+00:00",
+  "patches": {
+    "patches/phase3-common.patch": {
+      "application_check_passed": true,
+      "result_hashes_matched": true,
+      "files_checked": 5
+    },
+    "patches/phase3-xnu.patch": {
+      "application_check_passed": true,
+      "result_hashes_matched": true,
+      "files_checked": 8
+    },
+    "patches/phase4-common.patch": {
+      "application_check_passed": true,
+      "result_hashes_matched": true,
+      "files_checked": 13
+    },
+    "patches/phase4-xnu.patch": {
+      "application_check_passed": true,
+      "result_hashes_matched": true,
+      "files_checked": 15
+    }
+  },
+  "patch_hashes": {
+    "patches/phase3-common.patch": {
+      "bytes": 15210,
+      "sha256": "4aa94b2f92fa66e7cc0a1ad3af5ac7dd484ac8b76b34565f02b9becae76a1586"
+    },
+    "patches/phase3-xnu.patch": {
+      "bytes": 17051,
+      "sha256": "bcfb61df31ff9d92a974f66f33ff3b189a2a004d3977f4307ad2f11f4a9b10e3"
+    },
+    "patches/phase4-common.patch": {
+      "bytes": 93273,
+      "sha256": "82cc8302b0f9405ae9d952641be5d1438270f7642001598201a54728358a5bf5"
+    },
+    "patches/phase4-xnu.patch": {
+      "bytes": 81296,
+      "sha256": "581317c063bdf50b2bdaedd2ba8739bfd0dcde786e3ba884ae14fed9b24218d4"
+    }
+  },
+  "common_commit": "63fc2b4633bac3af8e57dadab9f5a8d4cb940438",
+  "xnu_commit": "c54f35ca767986246321eb901baf8f5ff7923f6a",
+  "native_baseline": "pinned common checkout after upstream xnu/apply.sh",
+  "commands": [
+    {
+      "cwd": "/tmp/a51-public-patch-9f8j_okm",
+      "arguments": [
+        "git",
+        "apply",
+        "--check",
+        "--whitespace=nowarn",
+        "/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/publication/hakios-SM-A515F/patches/phase3-common.patch"
+      ]
+    },
+    {
+      "cwd": "/tmp/a51-public-patch-9f8j_okm",
+      "arguments": [
+        "git",
+        "apply",
+        "--whitespace=nowarn",
+        "/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/publication/hakios-SM-A515F/patches/phase3-common.patch"
+      ]
+    },
+    {
+      "cwd": "/tmp/a51-public-patch-_hmspwk9",
+      "arguments": [
+        "git",
+        "apply",
+        "--check",
+        "--whitespace=nowarn",
+        "/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/publication/hakios-SM-A515F/patches/phase3-xnu.patch"
+      ]
+    },
+    {
+      "cwd": "/tmp/a51-public-patch-_hmspwk9",
+      "arguments": [
+        "git",
+        "apply",
+        "--whitespace=nowarn",
+        "/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/publication/hakios-SM-A515F/patches/phase3-xnu.patch"
+      ]
+    },
+    {
+      "cwd": "/tmp/a51-public-patch-hlq92cp9",
+      "arguments": [
+        "git",
+        "apply",
+        "--check",
+        "--whitespace=nowarn",
+        "/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/publication/hakios-SM-A515F/patches/phase4-common.patch"
+      ]
+    },
+    {
+      "cwd": "/tmp/a51-public-patch-hlq92cp9",
+      "arguments": [
+        "git",
+        "apply",
+        "--whitespace=nowarn",
+        "/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/publication/hakios-SM-A515F/patches/phase4-common.patch"
+      ]
+    },
+    {
+      "cwd": "/tmp/a51-public-patch-rd9m5f3x",
+      "arguments": [
+        "git",
+        "apply",
+        "--check",
+        "--whitespace=nowarn",
+        "/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/publication/hakios-SM-A515F/patches/phase4-xnu.patch"
+      ]
+    },
+    {
+      "cwd": "/tmp/a51-public-patch-rd9m5f3x",
+      "arguments": [
+        "git",
+        "apply",
+        "--whitespace=nowarn",
+        "/mnt/c/Users/Ankit/Desktop/A51/hakios-a51/publication/hakios-SM-A515F/patches/phase4-xnu.patch"
+      ]
+    }
+  ],
+  "device_operations": false,
+  "scope": "application and exact result hashes for all changed files in temporary baseline trees"
+}

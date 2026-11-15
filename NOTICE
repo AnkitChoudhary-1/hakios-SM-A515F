@@ -1,0 +1,20 @@
+HakiOS for Samsung Galaxy A51 (SM-A515F)
+Copyright (c) 2026 Ankit Choudhary and contributors.
+
+Based on oosexgang/hakios-xnu-kernel at
+63fc2b4633bac3af8e57dadab9f5a8d4cb940438.
+Retain the HakiOS contributors' MIT notice in LICENSES/HakiOS-MIT.txt.
+
+Apple XNU 8796.121.2 is the open-source kernel baseline, commit
+c54f35ca767986246321eb901baf8f5ff7923f6a.
+XNU-derived modifications retain APSL 2.0 (LICENSE.APSL) and applicable
+original per-file copyright/license notices. Explicitly MIT standalone
+integration files retain their notices; this repository does not relabel
+XNU-derived code as MIT.
+
+Android/Linux diagnostic modules and adaptations retain their declared GPL
+license and original notices. The GPL 2.0 text is LICENSES/GPL-2.0.txt.
+
+Third-party source/dependency origins are in THIRD_PARTY_LICENSES.md and the
+source lock. No vendor firmware, Apple runtime/SDK files, device backups or
+binary images are redistributed by this publication.

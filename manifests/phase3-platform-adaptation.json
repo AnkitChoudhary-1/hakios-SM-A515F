@@ -1,0 +1,96 @@
+{
+  "packet": "evidence/phase-3/platform-adaptation/20261114T020350201701Z",
+  "schema_version": 1,
+  "scope": "isolated_single_core_a51_platform_adaptation",
+  "root": "/opt/a51-hakios/experimental/phase3-port/20261114T013656044425Z",
+  "changes": [
+    {
+      "tree": "native",
+      "path": "pexpert/pexpert/arm64/BCM2837.h",
+      "after": {
+        "bytes": 3267,
+        "sha256": "6cc8a4148fe6cc6001742fd214594e79b0db5f73ac179b2d0112f4455eb3100e"
+      }
+    },
+    {
+      "tree": "native",
+      "path": "pexpert/arm/pe_fiq.c",
+      "after": {
+        "bytes": 5423,
+        "sha256": "0127f90dc9fd60ee5185aac28b0d5353f759b73b2f5d8b997b3e2119d4ff63c2"
+      }
+    },
+    {
+      "tree": "native",
+      "path": "osfmk/arm64/loader_return.c",
+      "after": {
+        "bytes": 23153,
+        "sha256": "ba5a0ceeed9d98d5516c2688d55d26ba5791c1e4005fad165226ca8432e39e71"
+      }
+    },
+    {
+      "tree": "native",
+      "path": "osfmk/conf/files.arm64",
+      "after": {
+        "bytes": 4072,
+        "sha256": "a067977e0ddb7835029cbee10faccf5ff92402d2baef5530e4ef5683f78f69e6"
+      }
+    },
+    {
+      "tree": "native",
+      "path": "osfmk/arm64/gic_v2_irq.c",
+      "after": {
+        "bytes": 7207,
+        "sha256": "d7c2c15b62fad97fa8280c0582a5b3425416b8d4b9eba09f60292e8816deb84c"
+      }
+    },
+    {
+      "tree": "native",
+      "path": "makedefs/MakeInc.def",
+      "after": {
+        "bytes": 40037,
+        "sha256": "c3d8f2cf41acfd8ad8cbc0e648fb9c7d10add4abcc2590d7b6b58b2ab4b7b6ac"
+      }
+    },
+    {
+      "tree": "common",
+      "path": "userland/src/hello.c",
+      "after": {
+        "bytes": 6994,
+        "sha256": "2b1c7624bb6f5445014375922da512b393e27432756b76bc5278958723a4813d"
+      }
+    },
+    {
+      "tree": "common",
+      "path": "drivers/core/hakios.platform.c",
+      "after": {
+        "bytes": 3844,
+        "sha256": "9bcd64e41845fbd699b72f3d74c4e016abd54b3e73467d90a384306db2bfdfd5"
+      }
+    },
+    {
+      "tree": "native",
+      "path": "bsd/dev/hakios.platform.c",
+      "after": {
+        "bytes": 3844,
+        "sha256": "9bcd64e41845fbd699b72f3d74c4e016abd54b3e73467d90a384306db2bfdfd5"
+      }
+    },
+    {
+      "tree": "native",
+      "path": "osfmk/arm64/start.s",
+      "after": {
+        "bytes": 31660,
+        "sha256": "1b63d6efb29b2abd377fa5dbb8b7de8459558e6a33a78f9d495889a1cb18710e"
+      }
+    }
+  ],
+  "build_verified": false,
+  "device_operations": false,
+  "phase_3_device_gate_passed": false,
+  "correction_packets": [
+    "evidence/phase-3/platform-corrections/20261114T021724192310Z",
+    "evidence/phase-3/platform-corrections/20261114T022715715598Z",
+    "evidence/phase-3/native-return-correction/20261114T034928610104Z"
+  ]
+}

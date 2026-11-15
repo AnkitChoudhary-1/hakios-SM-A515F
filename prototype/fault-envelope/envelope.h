@@ -1,0 +1,27 @@
+/* SPDX-License-Identifier: GPL-2.0 */
+#define HKF_MAGIC 0x31464c45494b4148
+#define HKF_BYTES 512
+#define HKF_STATUS 24
+#define HKF_EL 32
+#define HKF_SCTLR 40
+#define HKF_DAIF 48
+#define HKF_NZCV 56
+#define HKF_SPSEL 64
+#define HKF_VBAR 72
+#define HKF_SP 80
+#define HKF_LR 88
+#define HKF_ARGS 96
+#define HKF_CTR 128
+#define HKF_LINE 136
+#define HKF_VECTOR 144
+#define HKF_ESR 152
+#define HKF_ELR 160
+#define HKF_FAR 168
+#define HKF_SPSR 176
+#define HKF_FAULTS 184
+#define HKF_VALUE 192
+#define HKF_ENTRY 200
+#define HKF_SITE 208
+#define HKF_RESUME 216
+#define HKF_ARMED 224
+#define HKF_COMMIT 232

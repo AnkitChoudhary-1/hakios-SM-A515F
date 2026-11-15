@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "root": "/opt/a51-hakios/experimental/phase3-port/20261114T013656044425Z",
+  "packet": "evidence/phase-3/platform-build/20261114T035140706195Z",
+  "commands": [
+    {
+      "label": "kernel",
+      "argv": [
+        "bash",
+        "tools/make-kernel.sh",
+        "-j2",
+        "MAKEJOBS=--jobs=2",
+        "SHELL=/bin/bash"
+      ],
+      "started_utc": "2026-11-14T03:51:41.477333+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-11-14T03:57:04.094897+00:00"
+    },
+    {
+      "label": "hello",
+      "argv": [
+        "make",
+        "hello",
+        "SHELL=/bin/bash"
+      ],
+      "started_utc": "2026-11-14T03:57:04.094987+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-11-14T03:57:04.308367+00:00"
+    },
+    {
+      "label": "artifact-identification",
+      "argv": [
+        "file",
+        "hakios-kernel",
+        "userland/hello"
+      ],
+      "started_utc": "2026-11-14T03:57:04.308466+00:00",
+      "exit_code": 0,
+      "finished_utc": "2026-11-14T03:57:04.356198+00:00"
+    }
+  ],
+  "build_verified": true,
+  "device_operations": false,
+  "phase_3_device_gate_passed": false,
+  "artifacts": {
+    "hakios-kernel": {
+      "bytes": 15183296,
+      "sha256": "94dd41e111640aa1048c7c862ede282ee4d8d1f19cecd960f72184c904d34c07"
+    },
+    "userland/hello": {
+      "bytes": 16584,
+      "sha256": "14e198c86e624958e64a39a609ea97d6c19fa6b9bcd618191b463262e333e705"
+    },
+    ".config": {
+      "bytes": 11858,
+      "sha256": "a8776ce374ca9ce8ff0e5dc20e426129477ae29cc9e502d30669a8c396843b50"
+    },
+    "xnu-build.log": {
+      "bytes": 148441,
+      "sha256": "a036db9824900831e0c18c9f38822b1b0d445dc0ccb7900ea5c4169ae8c93a30"
+    }
+  }
+}
