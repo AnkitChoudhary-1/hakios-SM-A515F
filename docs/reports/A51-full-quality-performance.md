@@ -1,0 +1,70 @@
+# A51 full-quality performance candidate — 22 November 2026
+
+Owner requests implementing alternatives to Metal before attempting a Metal backend. Full iPhone X render geometry (1125 × 2436, 375 × 812 points at scale 3), wallpaper, blur, animations and navigation must be preserved. Speaker, apps, charging and Metal development are paused. iOS remains running until the owner returns to Android manually.
+
+## Current status
+
+Source changes, kernel/userland compilation, host correctness tests and independent package verification passed. Recovery-only installation and matching read-back passed, and the full-quality kernel reached Home. The six-minute host collection completed with iOS still running, without a stop or reboot command. On-device clocks and geometry are verified. The owner reports a substantial improvement but estimates only 20–25 FPS and requests 40–50 FPS. These estimates are not instrumented presentation measurements. Wi-Fi initially obtained DHCP and loaded web pages, then lost its lease during the extended run: the owner reports IP 169.254.136.237 and a blank router. Charging indication is absent. Stable 50–60 FPS throughout the UI remains unverified. Hardware scaling and direct scanout remain unimplemented. Tested parent directory: `outputs/full-quality`. Exact pre-edit source copies and hashes remain in `source-before/` and `source-changes.json`. The next candidate is documented in [A51-scheduling-DHCP-recovery.md](A51-scheduling-DHCP-recovery.md). Existing battery/audio/binding-table work was preserved.
+
+## Implemented alternatives
+
+- Existing Panfrost/OpenGL ES renderer: reuse allocated level-zero texture storage with subimage updates when an IOSurface changes. New/replaced bindings and ordinary/compressed client texture redefinitions invalidate reuse. Keep the existing seed and wrapped-memory change checks, format conversion, inversion and plane handling. Hash the final 1–7 bytes previously omitted. Batch mirror flushes while retaining existing GPU fence/finish synchronization.
+- Display-copy path: paired general-register framebuffer stores preserve exact scalar interpolation, and the nearest-neighbor path uses paired stores too. This avoids kernel SIMD state changes and reduces scalar write instructions. Actual bus traffic and timing still need phone measurement. Existing triple buffers and priority-92 copy thread remain in use; they are earlier work, not new features.
+- Ordinary CPU/GPU clock control: replace unusable firmware FREQ_GET verification with read-only PLL/mux/divider validation following Samsung's `cal_dfs_get_rate` / `vclk_recalc_rate` clock-tree approach. Requests still go through firmware so voltage and frequency are managed together. Verify a stable supported original rate and temperatures before boosting; verify actual hardware after every request and once per second. Invalid sensor, drift or unverified requests disable further boosts and require verified original-rate restoration. Fix the initial sensor mapping (GPU=0, A53=1, A73=2). GPU OPP entries now match the connected Android phone's table. MIF/INT bus boosts remain disabled.
+- Boot package: compact independent `full-quality` profile, manual-return and tracing arguments first, with conservative loader-prefix-aware capacity validation. The former raw-payload-only check missed truncation at the 607-byte effective XNU limit.
+
+## Display options that still require driver work
+
+The current framebuffer uses DPP2, whose live DT attributes lack scaling. DPP1 supports scaling, but changing channels requires validated DECON routing, clocks, filters, formats and synchronization. Writing scaling registers on DPP2 cannot enable hardware it lacks.
+
+Direct presentation is also incomplete: IOSurface allocations commonly exceed 4 GiB while DECON addresses are 32 bits. It needs an IOMMU/buffer-allocation path and explicit ownership/fence handling. GPU scaling into a panel-sized mirror is another potential route, but needs a retained kernel surface association and display lifetime/fence API. These paths were investigated; they are not implemented or claimed operational in this candidate.
+
+## Clock references and requested levels
+
+`android-clock-reference.txt` contains read-only live Android frequency tables and idle GPU status. Idle GPU clock 0 is normal when powered off. Supported GPU levels are 260, 338, 385, 455, 546, 572, 683, 764, 839, 949 and 1053 MHz. Candidate requests A53 1638 MHz, A73 2080 MHz and GPU 683 MHz, within the captured tables; no overclocking. Requested settings do not establish applied clocks.
+
+Source references: Samsung `drivers/soc/samsung/cal-if/exynos9610/cmucal-node.c` and `cmucal-sfr.c`. CPU CMUs 0x10900000/0x10800000 and GPU CMU 0x11430000; PLL enable/stable bits 31/29, selected PLL parent, no mux/divider transition. The CPU and GPU BUSD dividers use EMPTY_CAL_ID for DIVRATIO; GPU BUSP is a different peripheral clock. CPU supported rates require exact kHz matches. The GPU table rounds some hardware PLL rates to whole MHz; normalization allows at most 500 kHz and must find a unique OPP. MMIO snapshots must remain stable across repeated reads.
+
+## Validation and success criteria
+
+Completed host checks on 22 November (Asia/Calcutta):
+
+- Actual extracted clock, renderer and both scaler paths passed ASan/UBSan checks. Scaler tests covered 3,000 random rows, both alignments, odd/even widths, final-column bounds and exact four-channel interpolation. Renderer tests covered storage reuse, client redefinition, changed geometry, shared surfaces, inversion and checksum tails. AArch64 assembly uses general-register wide stores without SIMD. See `full-quality/correctness-tests.json`.
+- Twelve existing clock-guard policy cases passed. Kernel and userland linked. XNU's known configuration-specific kext symbol-set checks remain excluded by the existing `tools/make-kernel.sh` policy; no new compile/link failure was accepted.
+- The first builds did not sync `xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp` into the active XNU tree. Comparing actual source copies detected this. The file was synchronized and rebuilt; `kernel-build-console-synced.txt` records compilation of `MiniIOMobileFramebuffer.cpo` and the resulting kernel link. GPU source copies also match. The prior compiled framebuffer is saved separately.
+- APFS build/read-back checks passed and both ACPM firmware files matched their source copies. Package verification passed component/payload/image/archive hashes, original-quality arguments and saved recovery rollback. Effective command-line maximum is 557/607 bytes, including conservative loader prefixes. See `full-quality/static-verification.json`.
+- Fresh RAM payload preparation with frame tracing and manual return passed. No `fbscale`, geometry overrides, `ui_lite`, `vblur`, wallpaper suppression or animation overrides are present. Runtime confirms the full render geometry and requested clocks. Home screenshots preserve wallpaper and a translucent dock; still images cannot establish correct rendering of every effect or smooth animations.
+
+Test actual extracted renderer/clock/scaler functions, including geometry redefinition, packed surface hash tails, panel row boundaries and guard failures. Compile/link kernel and userland, verify firmware and package hashes, full-quality arguments, effective command-line budget and saved recovery rollback. Guarded installer may change recovery only after live identity/GPT/Android boot/system/backup checks and verify read-back.
+
+Collect matched Settings scrolling and navigation after warm-up. Confirm full geometry/effects and applied clocks from runtime logs. Retain long stalls and black-box reports. Frame-copy completions and pending-buffer replacements are not distinct panel scanouts, so neither isolated peaks nor average copy FPS prove stable 50–60 FPS throughout the UI.
+
+## Completed phone collection
+
+Run: `full-quality/boot-tests/20261121T215711-246564Z/`. Recovery image SHA256 `da7925a413093b83fbbbe8c1c796c9b07d797909b191a5844bc5ed31ddf159e9`; the guarded installer verified its read-back, backups, GPT, Android boot and existing iOS system region. Host UTC installation timestamp 21 November 21:56 corresponds to 22 November 03:26 IST.
+
+The runtime command line uses 535/607 bytes, preserving every intended argument. CoreAnimation reports 1125 × 2436 at scale 3 and the split-1125 status-bar provider. Mesa reports Mali-G72 (Panfrost), OpenGL ES 3.1. Hardware rate verification confirms firmware applied A53 1,638,000 kHz, A73 2,080,000 kHz and GPU 683,000 kHz, up from boot-loader rates 1,053,000 / 1,456,000 / 260,000 kHz. Captured repeated checks report guard faults `000`; no frequency request is accepted solely on acknowledgement. The reported cumulative temperature maxima are A53 58°C, A73 77°C and GPU 63°C, with zero reported downsteps. GPU reports show zero failed jobs or resets, with three handled heap faults. These observations cover captured snapshots, not an indefinite thermal/stability test.
+
+The log-collection window was 360 seconds, with `loader_return_after=0`. This is a host collection duration, not a device run limit. Collection finished at 03:33 IST on 22 November, and the last loader query at 354 seconds reported `running 0 0`. No stop/reboot command was sent. The owner subsequently estimated 20–25 FPS and reported the late network failure described above.
+
+Read-only follow-up collection `full-quality/boot-tests/20261122T025424-436985Z/` recorded cumulative temperature maxima A53 66°C, A73 86°C and GPU 71°C, with three clock reductions and three restorations. Current readings were lower, approximately 45/50/47°C. The earlier zero-downstep statement describes the initial capture only. The firmware clock verification guards remained `000`. Higher requested clocks are not a demonstrated solution to sustained FPS.
+
+Original boot `log-004.txt` recorded IPv4 172.28.223.196 with router/DNS 172.28.223.8 and a one-hour DHCP lease, plus successful HTTP and Apple HTTPS probes. Association does not prove a valid IP configuration or internet access. The later link-local address and missing router establish a DHCP configuration failure; its cause and recovery still require a new hardware test. Search retained logs with `rg -a`, since they contain NUL bytes.
+
+`frame-analysis.txt` matches 4,139 framebuffer-copy completions to handed-over swaps. Nine touch-start traces correspond to the existing boot-job Home gesture and four pairs of horizontal page swipes. They do not establish the requested repeated Settings workload. The analysis's moving intervals report 22% above 18 ms and 2% above 34.5 ms across 1,246 steps. That analysis excludes gaps of 100 ms or longer. Separate all-gap windows in `hardware-evidence.json` retain those gaps: window copy rates span approximately 48.3–76.1 completions/s, p95 gaps span 25.3–36.8 ms, and the largest observed gap is 309.9 ms. Gesture windows can include deliberate pauses and snapshot loss, so these are observations rather than a controlled stutter count.
+
+These are copy completions, **not distinct screen presentations**. The existing triple-buffer path can replace a pending frame before DECON takes it; rates above 60 illustrate why copy throughput cannot be reported as panel FPS. Overlapping draw/GPU/copy work also prevents treating the analyzer's attribution numbers as an additive frame budget. Average drawing was 5.1 ms on big cores and 10.8 ms on small cores in the matched sample, but slow-frame tails and final presentation still matter. Earlier full-quality runs used different interaction workloads, so no controlled percentage improvement is claimed.
+
+Reviewed `screen-016.png`: Home icons and text, wallpaper, translucent dock and split status bar are visible. Weather's placeholder content is not evidence of a rendering fault. One screenshot cannot rule out intermittent black boxes or verify Home/Control Center gestures. The host report marks Home verified from this screenshot while leaving navigation and sustained FPS unverified. `runtime-verification.json` links exact tested component hashes, the recovery read-back event, runtime arguments, clock/temperature logs and screenshot hash. Package/source provenance now records this hardware test; the run's original collector manifests remain unchanged.
+
+The next useful measurement is the owner's repeated Settings/gesture workload at full quality after warm-up, including distinct presentation timing. If stutter persists, new display-driver work is still an alternative before Metal: GPU scaling into display-owned buffers or a validated DPP1 route, with buffer ownership, addressing and fences. None is claimed operational by the current copy-loop optimization.
+
+## Reproduction
+
+Use the saved source state/provenance, not the one-time mutation scripts, for incremental rebuilds. In WSL run `outputs/scripts/build-a51-full-quality-kernel.sh` and `build-a51-full-quality.sh`, then `test-a51-full-quality.py`, `test-a51-clock-guard.py`, `prepare_boot.py --profile full-quality` and `verify-a51-full-quality-build.py`. The kernel helper synchronizes the framebuffer source and rejects unexpected active-tree edits. In Windows run `python outputs/scripts/verify-a51-full-quality.py` before the guarded installer. Source build paths and logs are under `/opt/a51-hakios/upstream-a51/hakios`; host scripts and results are in this workspace's `outputs` directory.
+
+The saved run's summary and runtime provenance have been updated with the owner's 20–25 FPS estimate, improvement report and DHCP failure. The reviewed Home screenshot remains `screen-016.png`. The host summary and recording scripts operate on saved files and never contact the phone; preserve the original collector manifests.
+
+## Return to Android
+
+Odin `D:\Odin3_v3.14.4\Odin3_v3.14.4\Odin3_v3.14.4.exe`, AP only: `C:\Users\Ankit\Documents\Codex\2026-11-21\hi-2\outputs\restore-current-recovery-RZ8N2032ZXE.tar.md5`. BL/CP/CSC empty, Re-Partition OFF, no PIT, Auto Reboot ON. If recovery opens, choose Reboot → System without wiping. No automatic timed iOS return is enabled.

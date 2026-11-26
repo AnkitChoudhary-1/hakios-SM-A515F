@@ -1,0 +1,14 @@
+# The watcher is indefinite; it never stops or reboots iOS.
+/redwood/bin/net_test wait 55 recover en0 &
+# Same renderer check; allow network daemons to finish DNS setup before probes.
+/redwood/bin/cputop 10 &
+/redwood/bin/gl_test 0 320 240 &
+/redwood/bin/net_test wait 50 wifi waitaddr en0 60 store resolve example.com tcp example.com 80 reach example.com fetch https://www.apple.com/library/test/success.html &
+/redwood/bin/rwtouch wait 100 swipe 0.5 0.985 0.5 0.3 200 wait 8
+# Repeat the same left/right gesture pair at 120, 150, 180 and 210 seconds.
+/redwood/bin/rwtouch wait 12 swipe 0.85 0.5 0.15 0.5 300 wait 2 swipe 0.15 0.5 0.85 0.5 300 wait 27
+/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 2 swipe 0.15 0.5 0.85 0.5 300 wait 27
+/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 2 swipe 0.15 0.5 0.85 0.5 300 wait 27
+/redwood/bin/rwtouch swipe 0.85 0.5 0.15 0.5 300 wait 2 swipe 0.15 0.5 0.85 0.5 300 wait 15
+/redwood/bin/fps_info
+/redwood/bin/net_test store resolve example.com tcp example.com 80 fetch https://www.apple.com/library/test/success.html

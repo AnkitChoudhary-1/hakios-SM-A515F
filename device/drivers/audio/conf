@@ -1,0 +1,4 @@
+# A51 audio bring-up, separate from the Qualcomm SOUND/ADSP drivers.
+driver A51AUDIO
+	file bsd/dev/hakios.a51audio.c
+	help a51audio=1: read-only Exynos audio power and clock baseline

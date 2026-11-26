@@ -1,0 +1,24 @@
+# Network recovery daemon (starts after apps have had time to launch)
+/redwood/bin/net_test wait 55 recover en0 &
+
+# Background persistence daemon (syncs /private/var every 30s)
+/redwood/bin/var_store watch 30 &
+
+# Swipe up to unlock lock screen
+/redwood/bin/rwtouch wait 25 swipe 0.5 0.985 0.5 0.3 200 wait 5
+
+# Register Instagram with LaunchServices
+/redwood/bin/uicache -p /private/preboot/apps/Instagram.app
+/redwood/bin/rwtouch wait 4
+
+# Open Instagram via SpringBoard
+/redwood/bin/battery_test open instagram://
+/redwood/bin/uiopen instagram://
+/redwood/bin/rwtouch wait 8
+/redwood/bin/fps_info
+
+# Automated fallback tap on "Not now" (x=0.5, y=0.90) after 15s if Save Info is presented
+/redwood/bin/rwtouch wait 15 tap 0.5 0.90 &
+
+# Route audio through SpringBoard and CoreAudio speaker
+/redwood/bin/sound_test route &

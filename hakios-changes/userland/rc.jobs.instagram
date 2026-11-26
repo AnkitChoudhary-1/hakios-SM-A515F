@@ -1,0 +1,28 @@
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+/redwood/bin/hello_dyn started by launchd
+/redwood/bin/svc_test
+/redwood/bin/surf_test
+/bin/ps -A
+/redwood/bin/mg_test
+/redwood/bin/cpu_test 240 &
+# Swipe up to open lock screen
+/redwood/bin/rwtouch wait 25 swipe 0.5 0.985 0.5 0.3 200 wait 5
+
+# Ensure clean Instagram session state and directory permissions
+mkdir -p /private/var/mobile/Library
+rm -rf /private/var/mobile/Containers/Data/Application/*/Library/Caches/*
+rm -rf /private/var/mobile/Containers/Data/Application/*/Library/Preferences/com.burbn.instagram.plist*
+rm -rf /private/var/mobile/Containers/Data/Application/*/Documents/*
+rm -rf /private/var/mobile/Containers/Data/Application/*/tmp/*
+chown -R 501:501 /private/var/mobile/Containers 2>/dev/null || true
+chown -R 501:501 /private/var/mobile/Library 2>/dev/null || true
+
+# Register Instagram with LaunchServices
+/redwood/bin/uicache -p /private/preboot/apps/Instagram.app
+/redwood/bin/rwtouch wait 4
+# Open Instagram via SpringBoard
+/redwood/bin/battery_test open instagram://
+/redwood/bin/uiopen instagram://
+/redwood/bin/rwtouch wait 6
+# Keep running smoothly and output FPS
+/redwood/bin/fps_info

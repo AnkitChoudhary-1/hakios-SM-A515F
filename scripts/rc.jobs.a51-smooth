@@ -1,0 +1,14 @@
+# Network recovery daemon (starts after system has had time to launch)
+/redwood/bin/net_test wait 55 recover en0 &
+
+# Background persistence daemon (syncs /private/var every 30s)
+/redwood/bin/var_store watch 30 &
+
+# Route audio through SpringBoard and CoreAudio speaker, test raw tone + springboard system sounds
+/redwood/bin/sound_test springboard route wait 22 level 1.0 raw 2 wait 2 tone 3 wait 3 system 1100 wait 2 system 1104 wait 2 file /System/Library/Audio/UISounds/New/Fanfare.caf &
+
+# Swipe up to unlock lock screen to SpringBoard Home Screen
+/redwood/bin/rwtouch wait 25 swipe 0.5 0.985 0.5 0.3 200 wait 2
+
+# Lightweight system load monitor
+/redwood/bin/cputop 10 &

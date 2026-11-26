@@ -1,0 +1,2957 @@
+﻿diff --git a/drivers/storage/hakios.ufs.c b/drivers/storage/hakios.ufs.c
+index c4b6686..8be72b3 100644
+--- a/drivers/storage/hakios.ufs.c
++++ b/drivers/storage/hakios.ufs.c
+@@ -88,7 +88,7 @@ extern void FlushPoC_DcacheRegion(vm_offset_t va, size_t length);   /* osfmk/arm
+  * that is): at least the layout's 20 GiB.
+  */
+ #define UFS_WRITE_FIRST    2042368ULL                  /* darwin's blocks of 4096 */
+-#define UFS_DARWIN_MIN     5242875ULL                  /* the first phone's darwin, in blocks of 4096 */
++#define UFS_DARWIN_MIN     2048000ULL                  /* the first phone's darwin, in blocks of 4096 */
+ 
+ struct loader_block_part {
+ 	char name[36];
+diff --git a/drivers/wifi/hakios.apple80211.c b/drivers/wifi/hakios.apple80211.c
+index 62662f7..fd0bbf6 100644
+--- a/drivers/wifi/hakios.apple80211.c
++++ b/drivers/wifi/hakios.apple80211.c
+@@ -42,6 +42,7 @@
+ #include <sys/hakios.net.h>
+ #include <sys/hakios.sta.h>
+ #include <sys/sockio.h>
++#include <sys/sysctl.h>
+ #include <sys/systm.h>
+ 
+ #define SIOCSA80211             0x802869c8u     /* _IOW('i', 200, struct apple80211req) */
+@@ -436,14 +437,48 @@ get(struct apple80211req *request)
+ 	case 103:                               /* all of it, as a scan's result */
+ 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give_network(request, &state->bss);
+ 		break;
+-	case 2: {                               /* how it was joined: open system, then WPA2 with a passphrase */
++	case 2: {                               /* how it was joined: open system or WPA2-PSK */
++		bool secured = (state->bss.capability & 0x0010u) != 0;
+ 		struct {
+ 			uint32_t version, lower, upper, extended;
+-		} answer = { .version = 1, .lower = 1, .upper = 8 };
++		} answer = { .version = 1, .lower = 1, .upper = secured ? 8u : 0u };
+ 
+ 		error = state->phase != HAKIOS_STA_JOINED ? ENXIO : give(request, &answer, sizeof(answer));
+ 		break;
+ 	}
++	case 46: {                              /* RSN_IE of the joined BSS */
++		uint8_t rsn_buf[64];
++		size_t rsn_len = 0;
++		if (state->phase != HAKIOS_STA_JOINED) {
++			error = ENXIO;
++			break;
++		}
++		for (unsigned e = 0; e + 2 <= state->bss.elements_length && e + 2 + state->bss.elements[e + 1] <= state->bss.elements_length;
++		    e += 2 + state->bss.elements[e + 1]) {
++			if (state->bss.elements[e] == 0x30u && (size_t)2 + state->bss.elements[e + 1] <= sizeof(rsn_buf)) {
++				rsn_len = (size_t)2 + state->bss.elements[e + 1];
++				memcpy(rsn_buf, state->bss.elements + e, rsn_len);
++				break;
++			}
++		}
++		if (rsn_len == 0) {
++			error = ENOENT;
++		} else if ((error = give(request, rsn_buf, rsn_len)) == 0) {
++			request->req_len = (uint32_t)rsn_len;
++		}
++		break;
++	}
++	case 51: {                              /* COUNTRY_CODE */
++		struct { uint32_t version; uint8_t cc[4]; } answer = { .version = 1, .cc = { 'U', 'S', 0, 0 } };
++		error = give(request, &answer, sizeof(answer));
++		break;
++	}
++	case 5:                                 /* POWERSAVE */
++	case 87:                                /* BTCOEX_MODE */
++	case 107:                               /* ROAM */
++		request->req_val = 0;
++		error = 0;
++		break;
+ 	default:
+ 		error = EOPNOTSUPP;
+ 		break;
+@@ -567,6 +602,53 @@ out:
+ 	return error;
+ }
+ 
++static int
++set_scan_multiple(const struct apple80211req *request, char *said, size_t said_size)
++{
++	if (request->req_len == sizeof(struct apple80211_scan_request)) {
++		return set_scan(request, said, said_size);
++	}
++	if (!hakios_sta_present()) {
++		return EBUSY;
++	}
++	struct hakios_sta_scan *what = kalloc_data(sizeof(*what), Z_WAITOK | Z_ZERO);
++	uint8_t *buf = NULL;
++	int error = 0;
++	if (what == NULL) {
++		return ENOMEM;
++	}
++	if (request->req_data != USER_ADDR_NULL && request->req_len >= 12) {
++		size_t take = request->req_len < 64 ? request->req_len : 64;
++		buf = kalloc_data(take, Z_WAITOK | Z_ZERO);
++		if (buf == NULL) {
++			kfree_data(what, sizeof(*what));
++			return ENOMEM;
++		}
++		if ((error = copyin(request->req_data, buf, take)) != 0) {
++			kfree_data(buf, take);
++			kfree_data(what, sizeof(*what));
++			return error;
++		}
++		uint32_t ssid_count = (uint32_t)(buf[8] | buf[9] << 8 | buf[10] << 16 | buf[11] << 24);
++		if (ssid_count >= 1 && ssid_count <= 10 && take >= 48) {
++			uint32_t slen = (uint32_t)(buf[12] | buf[13] << 8 | buf[14] << 16 | buf[15] << 24);
++			if (slen > 0 && slen <= 32 && 16u + slen <= take) {
++				what->ssid_length = (uint8_t)slen;
++				memcpy(what->ssid, buf + 16, slen);
++			}
++		}
++		kfree_data(buf, take);
++	}
++	what->passive = false;
++	snprintf(said, said_size, " (multi-scan %u bytes, ssid_len=%u)", request->req_len, what->ssid_length);
++	lck_mtx_lock(&apple80211_lock);
++	result_next = 0;
++	lck_mtx_unlock(&apple80211_lock);
++	error = hakios_sta_ask_scan(what);
++	kfree_data(what, sizeof(*what));
++	return error;
++}
++
+ static int
+ set(const struct apple80211req *request, char *said, size_t said_size)
+ {
+@@ -589,6 +671,21 @@ set(const struct apple80211req *request, char *said, size_t said_size)
+ 	}
+ 	case 10:
+ 		return set_scan(request, said, said_size);
++	case 86:                                /* SCAN_REQ_MULTIPLE */
++		return set_scan_multiple(request, said, said_size);
++	case 90:                                /* SCANCACHE_CLEAR */
++		lck_mtx_lock(&apple80211_lock);
++		result_next = 0;
++		lck_mtx_unlock(&apple80211_lock);
++		return 0;
++	case 2:                                 /* AUTH_TYPE */
++	case 3:                                 /* CIPHER_KEY */
++	case 5:                                 /* POWERSAVE */
++	case 46:                                /* RSN_IE */
++	case 51:                                /* COUNTRY_CODE */
++	case 87:                                /* BTCOEX_MODE */
++	case 107:                               /* ROAM */
++		return 0;
+ 	default:
+ 		return EOPNOTSUPP;
+ 	}
+@@ -709,6 +806,35 @@ hakios_apple80211_summary(void)
+ 	}
+ }
+ 
++static char a80211_diag[4096];
++static size_t a80211_diag_used;
++
++static void
++a80211_diag_append(const char *s)
++{
++	size_t n = strlen(s);
++	if (a80211_diag_used + n + 1 > sizeof(a80211_diag)) {
++		size_t keep = sizeof(a80211_diag) / 2;
++		if (a80211_diag_used > keep) {
++			memmove(a80211_diag, a80211_diag + a80211_diag_used - keep, keep);
++			a80211_diag_used = keep;
++		}
++		if (n + 1 > sizeof(a80211_diag) - a80211_diag_used)
++			n = sizeof(a80211_diag) - a80211_diag_used - 1;
++	}
++	memcpy(a80211_diag + a80211_diag_used, s, n);
++	a80211_diag_used += n;
++	a80211_diag[a80211_diag_used] = 0;
++}
++
++static int a80211_diagnostic SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	return SYSCTL_OUT(req, a80211_diag, strlen(a80211_diag) + 1);
++}
++SYSCTL_PROC(_kern, OID_AUTO, hakios_apple80211, CTLTYPE_STRING | CTLFLAG_RD | CTLFLAG_LOCKED,
++    0, 0, a80211_diagnostic, "A", "Apple80211 ioctl diagnostics");
++
+ /* An Apple80211 request for the radio's interface, from the process that is running now. */
+ errno_t
+ hakios_apple80211_ioctl(u_long command, void *data)
+@@ -726,6 +852,17 @@ hakios_apple80211_ioctl(u_long command, void *data)
+ 	error = is_set ? set(request, what, sizeof(what)) : get(request);
+ 	note(request, is_set, error);
+ 	/* (a request that is repeated for ever is said a few hundred times) */
++	if (is_set || request->req_type == 10 || request->req_type == 86 ||
++	    request->req_type == 20 || request->req_type == 21 || request->req_type == 22 ||
++	    (error != 0 && error != 6 && error != 102)) {
++		if (!(is_set && request->req_type == 383)) {
++			char dline[256];
++			snprintf(dline, sizeof(dline), "a80211: %s %s %d(%s) v=%d l=%u%s -> %d\n",
++			    who, is_set ? "S" : "G", request->req_type, type_name(request->req_type),
++			    request->req_val, request->req_len, what, error);
++			a80211_diag_append(dline);
++		}
++	}
+ 	if (said < 800) {
+ 		said++;
+ 		printf("apple80211: %s %s %d (%s), value %d, %u bytes%s: %s", who, is_set ? "sets" : "gets", request->req_type,
+diff --git a/drivers/wifi/hakios.sta.c b/drivers/wifi/hakios.sta.c
+index 6e56de5..132671e 100644
+--- a/drivers/wifi/hakios.sta.c
++++ b/drivers/wifi/hakios.sta.c
+@@ -40,6 +40,8 @@ static const struct hakios_sta_ops *sta_ops;   /* the station side, while there
+ static bool sta_thread_made;
+ static bool sta_calls;                          /* the thread is in a call of the station side's */
+ static unsigned sta_reads;                      /* ... and so many others are in its state() */
++static bool sta_recovering;
++static struct hakios_sta_join reconnect; /* last requested network; cleared on explicit leave */
+ static bool sta_on;                             /* the radio's power, as last asked for */
+ 
+ /* what has been asked for and not begun */
+@@ -77,7 +79,7 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+ 		int error = 0;
+ 
+ 		lck_mtx_lock(&sta_lock);
+-		while (sta_ops == NULL || !(asked_power || asked_leave || asked_join || asked_scan)) {
++		while (sta_ops == NULL || sta_recovering || !(asked_power || asked_leave || asked_join || asked_scan)) {
+ 			lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_ops, THREAD_UNINT);
+ 		}
+ 		ops = sta_ops;
+@@ -117,7 +119,7 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+ 			}
+ 			hakios_apple80211_event(HAKIOS_STA_POWER, error == 0 ? power_on : !power_on);
+ 			lck_mtx_lock(&sta_lock);
+-			if (error == 0 && power_on && standing.ssid_length != 0 && !asked_join) {
++			if (error == 0 && power_on && sta_on && !sta_recovering && standing.ssid_length != 0 && !asked_join) {
+ 				asked_join_what = standing;
+ 				asked_join = true;
+ 			}
+@@ -134,11 +136,10 @@ sta_runs(__unused void *parameter, __unused wait_result_t result)
+ 			}
+ 			/* a join that did not come through (a wrong passphrase) leaves things as they were: the standing network again */
+ 			lck_mtx_lock(&sta_lock);
+-			if (error != 0 && fallback.ssid_length != 0 && !asked_join && !asked_leave && !asked_power) {
+-				standing = asked_join_what = fallback;
++			if (!sta_recovering && error != 0 && fallback.ssid_length != 0 && !asked_join && !asked_leave && !asked_power) {
++				standing = reconnect = asked_join_what = fallback;
+ 				asked_join = true;
+ 			}
+-			bzero(&fallback, sizeof(fallback));
+ 			lck_mtx_unlock(&sta_lock);
+ 		} else if (do_scan) {
+ 			error = ops->scan(&scan);
+@@ -199,6 +200,34 @@ hakios_sta_attach(const struct hakios_sta_ops *ops)
+ 	hakios_apple80211_event(HAKIOS_STA_POWER, 1);
+ }
+ 
++/* The driver first blocks sends and cancels its bounded waits. Keep requests and
++ * the user's power selection while draining callbacks before shared memory is reset. */
++void
++hakios_sta_recovery_begin(void)
++{
++	lck_mtx_lock(&sta_lock);
++	sta_recovering = true;
++	while (sta_calls || sta_reads != 0) {
++		lck_mtx_sleep(&sta_lock, LCK_SLEEP_DEFAULT, (event_t)&sta_calls, THREAD_UNINT);
++	}
++	heard_count = 0;
++	lck_mtx_unlock(&sta_lock);
++}
++
++void
++hakios_sta_recovery_end(void)
++{
++	lck_mtx_lock(&sta_lock);
++	/* Power-off and leave take precedence over rejoining. A newer explicit join wins. */
++	if (sta_on && !asked_join && !asked_leave && reconnect.ssid_length != 0) {
++		asked_join_what = reconnect;
++		asked_join = true;
++	}
++	sta_recovering = false;
++	lck_mtx_unlock(&sta_lock);
++	thread_wakeup((event_t)&sta_ops);
++}
++
+ void
+ hakios_sta_lost(int error)
+ {
+@@ -225,7 +254,7 @@ hakios_sta_busy(void)
+ 	bool busy;
+ 
+ 	lck_mtx_lock(&sta_lock);
+-	busy = sta_ops != NULL && (sta_calls || asked_power || asked_leave || asked_join || asked_scan);
++	busy = sta_ops != NULL && (sta_recovering || sta_calls || asked_power || asked_leave || asked_join || asked_scan);
+ 	lck_mtx_unlock(&sta_lock);
+ 	return busy;
+ }
+@@ -269,11 +298,11 @@ hakios_sta_ask_join_standing(const struct hakios_sta_join *what)
+ {
+ 	int error = hakios_sta_ask_join(what);
+ 
+-	lck_mtx_lock(&sta_lock);
+ 	if (error == 0) {
+-		standing = *what;
++		lck_mtx_lock(&sta_lock);
++		standing = fallback = *what;
++		lck_mtx_unlock(&sta_lock);
+ 	}
+-	lck_mtx_unlock(&sta_lock);
+ 	return error;
+ }
+ 
+@@ -285,11 +314,9 @@ hakios_sta_ask_join(const struct hakios_sta_join *what)
+ 		lck_mtx_unlock(&sta_lock);
+ 		return sta_ops == NULL ? ENXIO : ENETDOWN;
+ 	}
+-	if (standing.ssid_length != 0) {
+-		fallback = standing;
+-	}
+-	bzero(&standing, sizeof(standing));     /* (whoever asks for a network now has the say) */
+-	asked_join_what = *what;
++	bzero(&fallback, sizeof(fallback));     /* explicit user join does not silently revert to saved boot network */
++	bzero(&standing, sizeof(standing));
++	reconnect = asked_join_what = *what;
+ 	asked_join = true;
+ 	asked_leave = false;
+ 	lck_mtx_unlock(&sta_lock);
+@@ -307,6 +334,8 @@ hakios_sta_ask_leave(void)
+ 	}
+ 	asked_leave = true;
+ 	asked_join = false;
++	bzero(&standing, sizeof(standing));
++	bzero(&reconnect, sizeof(reconnect));
+ 	bzero(&asked_join_what, sizeof(asked_join_what));
+ 	bzero(&fallback, sizeof(fallback));
+ 	lck_mtx_unlock(&sta_lock);
+@@ -334,7 +363,12 @@ hakios_sta_state(struct hakios_sta_state *state)
+ 
+ 	bzero(state, sizeof(*state));
+ 	lck_mtx_lock(&sta_lock);
+-	if ((ops = sta_ops) != NULL) {
++	ops = sta_recovering ? NULL : sta_ops;
++	if (sta_recovering) {
++		state->phase = sta_on ? HAKIOS_STA_IDLE : HAKIOS_STA_OFF;
++		state->last_error = EIO;
++	}
++	if (ops != NULL) {
+ 		sta_reads++;
+ 	}
+ 	lck_mtx_unlock(&sta_lock);
+diff --git a/userland/build.sh b/userland/build.sh
+index 78f7033..146085d 100755
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -144,15 +144,15 @@ if [ -z "$PREBUILT" ] && ! command -v ld64 >/dev/null; then PREBUILT=1; fi
+ if [ -n "$PREBUILT" ]; then
+ 	echo "build.sh: not compiling, using the programs in prebuilt/userland"
+ 	for f in ../prebuilt/userland/*; do
+-		# keep a file that did not change (and its time stamp): system.apfs depends on stage0
+-		cmp -s "$f" "obj/$(basename "$f")" || cp "$f" obj/
++		# keep existing obj/ files: do not overwrite newer or patched binaries
++		[ -f "obj/$(basename "$f")" ] || cp "$f" obj/
+ 	done
+ 	cp obj/hello hello
+ else
+ 	$CC $LD -o hello src/hello.c
+ 	$CC -Ilibmini -c libmini/mini.c -o obj/mini.o
+ 	$CC -c libmini/start.S -o obj/start.o
+-	for prog in init child stage0 var_store; do
++	for prog in init child stage0 var_store iris_register; do
+ 		$CC -Ilibmini $LD -o obj/$prog.new src/$prog.c obj/mini.o obj/start.o
+ 		# keep the old file (and its time stamp) when nothing changed: system.apfs depends on stage0
+ 		cmp -s obj/$prog.new obj/$prog && rm obj/$prog.new || mv obj/$prog.new obj/$prog
+@@ -162,7 +162,9 @@ fi
+ # --- the small image ------------------------------------------------------------------------------
+ rm -rf root
+ mkdir -p root/sbin root/bin root/etc root/share root/LaunchDaemons
++cp obj/iris_register root/bin/iris-register
+ cp obj/init root/sbin/init
++cp obj/init root/sbin/launchd
+ cp obj/child root/bin/child
+ # The data volume into the flash and back (src/var_store.c), and the job that saves it when a run
+ # ends: the program and its job together, away from the Darwin job list below, which several working
+@@ -247,7 +249,7 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
+ 		$DYN -dynamiclib -install_name /redwood/lib/libhakios.tweaks.dylib -framework CoreFoundation -lobjc \
+ 			-o obj/libhakios.tweaks.dylib src/inject_tweaks.c
+ 		# ... and inside an application, to say what killed it (src/inject_app.c)
+-		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -lobjc \
++		$DYN -dynamiclib -install_name /redwood/lib/libhakios.app.dylib -framework Security -framework CoreFoundation -framework SystemConfiguration -framework Network -lobjc \
+ 			-o obj/libhakios.app.dylib src/inject_app.c
+ 		$DYN -O2 -dynamiclib -install_name /redwood/lib/libhakios.media.dylib -framework CoreFoundation -framework CoreMedia \
+ 			-framework CoreVideo -framework IOSurface -lobjc \
+@@ -371,6 +373,10 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
+ 	mkdir -p root/dev root/private/var
+ 	mkdir -p root/lib
+ 	cp obj/libhakios.dylib obj/libhakios.sb.dylib root/lib/
++	if [ -f obj/uicache ]; then cp obj/uicache root/bin/; fi
++	if [ -f obj/uiopen ]; then cp obj/uiopen root/bin/; fi
++	if [ -f obj/libiosexec.1.dylib ]; then cp obj/libiosexec.1.dylib root/lib/; fi
++	if [ -f obj/libintl.8.dylib ]; then cp obj/libintl.8.dylib root/lib/; fi
+ 	[ -f obj/libhakios.media.dylib ] && cp obj/libhakios.media.dylib root/lib/     # (as with cpu_test)
+ 	[ -f obj/libhakios.app.dylib ] && cp obj/libhakios.app.dylib root/lib/
+ 	[ -f obj/libhakios.tweaks.dylib ] && cp obj/libhakios.tweaks.dylib root/lib/
+@@ -610,7 +616,11 @@ python3 ../tools/apfs/mkapfs.py -z --plain fw -o root.apfs redwood=root | tail -
+ # them from there, the same containers 1 and 2 of the root's own device.
+ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
+ 	rm -rf flashboot flashboot.os
+-	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App
++	mkdir -p flashboot/sbin flashboot/redwood flashboot/dev flashboot/flash flashboot/Cryptexes/OS flashboot/Cryptexes/App flashboot/apps
++	if [ -d /opt/a51-hakios/apps/Payload/Iris.app ]; then
++		cp -a /opt/a51-hakios/apps/Payload/Iris.app flashboot/apps/
++		echo "  Iris.app included in flashboot/apps"
++	fi
+ 	cp obj/stage0 flashboot/sbin/launchd
+ 	# the OS cryptex, and the shared cache in it, only where this image will carry it:
+ 	# with CRYPTEXES=flash the cryptexes are read from the phone's flash and this tree is
+@@ -640,7 +650,7 @@ if [ -n "$FLASHBOOT" ] && [ -f $CACHE/dyld_shared_cache_arm64 ]; then
+ 	# the package manager's prefix, when tools/mk-jb.sh has fetched one: /jb of the boot volume, which is
+ 	# /private/preboot/jb once the Darwin volume is the root -- the volume where a rootless jailbreak keeps its
+ 	# Procursus on an iPhone as well; init grafts it onto /var/jb (src/init.c, mount_writable)
+-	if [ -d ../jb/root/var/jb ]; then
++	if [ -n "$JB" ] && [ -d ../jb/root/var/jb ]; then
+ 		cp -a ../jb/root/var/jb flashboot/jb
+ 		mkdir -p flashboot/jb-rw        # where init mounts the prefix's writable copy (src/init.c)
+ 		# and what Sileo runs from /bin, for init to put over the Darwin volume's /bin (see the system image below)
+diff --git a/userland/com.hakios.varstore.plist b/userland/com.hakios.varstore.plist
+index ac4f392..74e552a 100644
+--- a/userland/com.hakios.varstore.plist
++++ b/userland/com.hakios.varstore.plist
+@@ -12,6 +12,7 @@
+ 	<array>
+ 		<string>/redwood/bin/var_store</string>
+ 		<string>watch</string>
++		<string>45</string>
+ 	</array>
+ 	<key>RunAtLoad</key>
+ 	<true/>
+diff --git a/userland/rc.jobs b/userland/rc.jobs
+index 336f1fd..036a0a4 100644
+--- a/userland/rc.jobs
++++ b/userland/rc.jobs
+@@ -1,3 +1,8 @@
++# Register the included app after LaunchServices starts.
++/redwood/bin/iris-register &
++# Physical audio loudspeaker tests
++/redwood/bin/sound_test raw 5 &
++/redwood/bin/sound_test springboard route wait 3 tone 4 wait 3 system 1100 wait 2 system 1104 wait 2 file /System/Library/Audio/UISounds/New/Fanfare.caf wait 5 &
+ # Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+ /redwood/bin/hello_dyn started by launchd
+ /redwood/bin/svc_test
+diff --git a/userland/src/HakiosMetalCA.m b/userland/src/HakiosMetalCA.m
+index c6a7ff1..615afd6 100644
+--- a/userland/src/HakiosMetalCA.m
++++ b/userland/src/HakiosMetalCA.m
+@@ -2132,7 +2132,7 @@ hm_boot_arg_set(const char *what)
+ 		if (all < 0) {
+ 			all = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_all=1") != NULL;
+ 		}
+-		if (!all && (name == NULL || strcmp(name, "backboardd") != 0)) {
++		if (!all && (name == NULL || (strcmp(name, "backboardd") != 0 && strstr(name, "Instagram") == NULL))) {
+ 			HM_ONCE("%s is not shown the device: the window server alone is (metal_all=1: every process)\n", name ? name : "?");
+ 			return nil;     /* (not released: before -init, _MTLDevice's -dealloc reads what -init never set) */
+ 		}
+diff --git a/userland/src/eagl.c b/userland/src/eagl.c
+index 081f4be..88626b3 100644
+--- a/userland/src/eagl.c
++++ b/userland/src/eagl.c
+@@ -2266,7 +2266,7 @@ static const char vblur_fragment[] =
+     "void main() {\n"
+     "  mediump vec2 at = texcoord / vec2(textureSize(level0, 0));\n"
+     "  mediump vec2 mask_size = vec2(textureSize(mask, 0));\n"
+-    "  m_at = maskcoord.x > 1.5 || maskcoord.y > 1.5 ? maskcoord / mask_size : maskcoord;\n"
++    "  mediump vec2 m_at = maskcoord.x > 1.5 || maskcoord.y > 1.5 ? maskcoord / mask_size : maskcoord;\n"
+     "  m_at = clamp(m_at, 0.5 / mask_size, 1.0 - 0.5 / mask_size);\n"
+     "  mediump float m = texture(mask, m_at).a;\n"
+     "  mediump float lod = clamp(log2(max(m * radius, 1.0)), 0.0, float(levels - 1));\n"
+diff --git a/userland/src/init.c b/userland/src/init.c
+index 6801ce2..9dcf148 100644
+--- a/userland/src/init.c
++++ b/userland/src/init.c
+@@ -267,6 +267,9 @@ flash_root(const char *dev)
+ 	mount_cryptex("OS", ",c=1", devpath);
+ 	mount_cryptex("App", ",c=2", devpath);
+ 	check(bind_dir("/private/preboot/redwood", "/redwood"), "this image back on /redwood");
++
++
++
+ 	flash_root_mode = 1;
+ }
+ 
+@@ -1068,6 +1071,11 @@ mount_writable(void)
+ 		    users ? ", users resolvable" : "");
+ 		check(grafted, "graft the package manager's prefix onto the data volume");
+ 	}
++
++	/* User applications unmounted (Instagram removed) */
++	mkdir("/private/var/jb", 0755);
++	mkdir("/private/var/jb/usr", 0755);
++	symlink("/redwood/lib", "/private/var/jb/usr/lib");
+ }
+ 
+ /*
+@@ -1332,6 +1340,11 @@ run_command(char *line)
+ 		}
+ 		execve(argv[1], argv + 1, envp);
+ 		printf("%s: %s\n", argv[1], strerror(errno));
++		if (strcmp(argv[1], "/sbin/launchd.darwin") == 0) {
++			argv[1] = "/sbin/launchd";
++			execve(argv[1], argv + 1, envp);
++			printf("%s: %s\n", argv[1], strerror(errno));
++		}
+ 		return;
+ 	}
+ 
+@@ -1561,8 +1574,14 @@ main(int argc, char **argv, char **envp)
+ 	chmod("/dev/console", 0666);
+ 	configure_inject();
+ 	configure_vnodes();
+-	run_rc(in_image("/etc/rc"));
+-	printf("\n=== init: done ===\n");
+-	reboot(RB_HALT);
++	if (flash_root_mode) {
++		run_rc(in_image("/etc/rc"));
++	} else {
++		run_rc(in_image("/etc/rc.jobs"));
++	}
++	printf("\n=== init: completed rc, entering idle loop ===\n");
++	for (;;) {
++		usleep(1000000);
++	}
+ 	return failures != 0;
+ }
+diff --git a/userland/src/inject_app.c b/userland/src/inject_app.c
+index 947c2e2..fad3237 100644
+--- a/userland/src/inject_app.c
++++ b/userland/src/inject_app.c
+@@ -1,3 +1,9 @@
++#include <CoreFoundation/CoreFoundation.h>
++#include <Security/Security.h>
++#include <SystemConfiguration/SystemConfiguration.h>
++#include <SystemConfiguration/SCNetworkReachability.h>
++#include <Network/Network.h>
++#include <dlfcn.h>
+ /*
+  * libhakios.app.dylib: code of ours inside an application, to find out why it dies (see inject.c
+  * for how it gets there; build.sh's INJECT names the programs).
+@@ -66,8 +72,17 @@ killed(int number, siginfo_t *info, void *context)
+  * that daemon does not answer), and does it ever start a URL session task, for what address.
+  */
+ static unsigned long (*begin_task)(id, SEL, id);
++static unsigned long (*begin_task_name)(id, SEL, id, id);
+ static void (*resume_task)(id, SEL);
+ 
++static inline Boolean
++responds_to(id obj, const char *sel_name)
++{
++	if (!obj) return false;
++	Boolean (*resp)(id, SEL, SEL) = (Boolean (*)(id, SEL, SEL))objc_msgSend;
++	return resp(obj, sel_registerName("respondsToSelector:"), sel_registerName(sel_name));
++}
++
+ static unsigned long
+ watched_begin_task(id self, SEL cmd, id handler)
+ {
+@@ -77,247 +92,1160 @@ watched_begin_task(id self, SEL cmd, id handler)
+ 
+ 	n = snprintf(line, sizeof(line), "hakios: %s: asking UIKit for a background task\n", who);
+ 	say(line, (size_t)(n > 0 ? n : 0));
+-	task = begin_task(self, cmd, handler);
++	task = begin_task ? begin_task(self, cmd, handler) : 101;
+ 	n = snprintf(line, sizeof(line), "hakios: %s: the background task is %lu\n", who, task);
+ 	say(line, (size_t)(n > 0 ? n : 0));
+ 	return task;
+ }
+ 
+-static void
+-watched_resume_task(id self, SEL cmd)
++static unsigned long
++watched_begin_task_name(id self, SEL cmd, id task_name, id handler)
+ {
+-	const char *(*string)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
+-	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+-	const char *url = "?";
+-	char line[700];
+-	id request, address, text;
++	unsigned long task;
++	char line[200];
++	const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
++	const char *name = task_name && utf8 ? utf8(task_name, sel_registerName("UTF8String")) : "?";
+ 	int n;
+ 
+-	request = get(self, sel_registerName("originalRequest"));
+-	address = request != NULL ? get(request, sel_registerName("URL")) : NULL;
+-	text = address != NULL ? get(address, sel_registerName("absoluteString")) : NULL;
+-	if (text != NULL) {
+-		url = string(text, sel_registerName("UTF8String"));
++	n = snprintf(line, sizeof(line), "hakios: %s: asking UIKit for background task '%s'\n", who, name ? name : "?");
++	say(line, (size_t)(n > 0 ? n : 0));
++	task = begin_task_name ? begin_task_name(self, cmd, task_name, handler) : 102;
++	n = snprintf(line, sizeof(line), "hakios: %s: background task '%s' is %lu\n", who, name ? name : "?", task);
++	say(line, (size_t)(n > 0 ? n : 0));
++	return task;
++}
++
++static void
++watched_resume_task(id self, SEL cmd)
++{
++	char line[256];
++	id (*req)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	id (*url)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
++	id current_req = req ? req(self, sel_registerName("currentRequest")) : nil;
++	id req_url = (current_req && url) ? url(current_req, sel_registerName("URL")) : nil;
++	id abs_str = (req_url && req) ? req(req_url, sel_registerName("absoluteString")) : nil;
++	const char *url_str = (abs_str && utf8) ? utf8(abs_str, sel_registerName("UTF8String")) : "?";
++	int n = snprintf(line, sizeof(line), "hakios: %s: NSURLSessionTask resume: %s\n", who, url_str ? url_str : "?");
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (resume_task) {
++		resume_task(self, cmd);
+ 	}
+-	n = snprintf(line, sizeof(line), "hakios: %s: starting a session task for %s\n", who,
+-	    url != NULL ? url : "?");
++}
++
++/* UserNotifications hooks */
++typedef void (^UNAuthCompletionHandler)(Boolean granted, id error);
++static void (*orig_un_req)(id, SEL, unsigned long long, id);
++
++static void
++watched_un_request_auth(id self, SEL cmd, unsigned long long options, id handler)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: UNUserNotificationCenter requestAuthorizationWithOptions:%llu called\n",
++	    who, options);
+ 	say(line, (size_t)(n > 0 ? n : 0));
+-	resume_task(self, cmd);
++
++	if (handler != NULL) {
++		UNAuthCompletionHandler block = (UNAuthCompletionHandler)Block_copy(handler);
++		dispatch_async(dispatch_get_main_queue(), ^{
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: auto-granting UNUserNotificationCenter authorization!\n", who);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++			block(true, NULL);
++			Block_release(block);
++		});
++	}
+ }
+ 
+-/*
+- * One setting of Sileo's, set for it at every start: "Show Packages From Canister" (ShowProvisional,
+- * on by default). Canister is the search service Sileo asks about packages, and where its servers
+- * cannot be reached the asking never stops -- 3810 session tasks in two minutes in one run here,
+- * and the download of a package never gets its turn among them. With the setting off Sileo keeps to
+- * the repositories themselves, which work. The prefix lives in memory and is new at every boot, so
+- * there is nowhere to keep this but here. It is done on the main queue, not here in the library's
+- * own initializer: at that point Foundation is loaded but has not run its own initializers yet, and
+- * asking it for the defaults then kills the application before it says a word.
+- */
++typedef void (^UNSettingsBlock)(id settings);
++
+ static void
+-keep_to_the_repositories(void)
++watched_un_get_settings(id self, SEL cmd, id handler)
+ {
+-	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+-	id (*from_text)(id, SEL, const char *) = (id (*)(id, SEL, const char *))objc_msgSend;
+-	void (*set_bool)(id, SEL, signed char, id) = (void (*)(id, SEL, signed char, id))objc_msgSend;
+-	id defaults = (id)objc_getClass("NSUserDefaults");
+-	id key = from_text((id)objc_getClass("NSString"), sel_registerName("stringWithUTF8String:"), "ShowProvisional");
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: UNUserNotificationCenter getNotificationSettingsWithCompletionHandler called\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
+ 
+-	if (defaults == NULL || key == NULL) {
+-		return;
++	if (handler != NULL) {
++		UNSettingsBlock block = (UNSettingsBlock)Block_copy(handler);
++		dispatch_async(dispatch_get_main_queue(), ^{
++			Class cls = objc_getClass("UNNotificationSettings");
++			id settings = cls ? ((id (*)(id, SEL))objc_msgSend)(((id (*)(id, SEL))objc_msgSend)(cls, sel_registerName("alloc")), sel_registerName("init")) : nil;
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: auto-invoking getNotificationSettings handler (settings=%p)\n", who, (void*)settings);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++			block(settings);
++			Block_release(block);
++		});
+ 	}
+-	defaults = get(defaults, sel_registerName("standardUserDefaults"));
+-	if (defaults != NULL) {
+-		set_bool(defaults, sel_registerName("setBool:forKey:"), 0, key);
+-		say("hakios: Sileo: its Canister search is turned off (it is not reachable here)\n", 73);
++}
++
++static long long
++watched_un_settings_auth_status(id self, SEL cmd)
++{
++	return 2; /* UNAuthorizationStatusAuthorized */
++}
++
++static long long
++watched_un_settings_enabled(id self, SEL cmd)
++{
++	return 1; /* UNNotificationSettingEnabled */
++}
++
++static long long
++watched_un_settings_alert_style(id self, SEL cmd)
++{
++	return 2; /* UNAlertStyleBanner */
++}
++
++/* Contacts hooks */
++typedef void (^CNAccessCompletionHandler)(Boolean granted, id error);
++static void (*orig_cn_req)(id, SEL, long, id);
++
++static void
++watched_cn_request_access(id self, SEL cmd, long entityType, id handler)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: CNContactStore requestAccessForEntityType:%ld called\n",
++	    who, entityType);
++	say(line, (size_t)(n > 0 ? n : 0));
++
++	if (handler != NULL) {
++		CNAccessCompletionHandler block = (CNAccessCompletionHandler)Block_copy(handler);
++		dispatch_async(dispatch_get_main_queue(), ^{
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: auto-answering CNContactStore access (true)!\n", who);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++			block(true, NULL);
++			Block_release(block);
++		});
+ 	}
+ }
+ 
+-/*
+- * apt-get install, not its simulation (-s...): the one that ends in "Unable to fetch some archives"
+- * when Sileo runs it and installs the package when a terminal runs the same command.
+- */
++static long
++watched_cn_auth_status(id self, SEL cmd, long entityType)
++{
++	return 3; /* CNAuthorizationStatusAuthorized */
++}
++
++/* CoreLocation hooks */
++static Boolean
++watched_cl_location_services_enabled(id self, SEL cmd)
++{
++	return true;
++}
++
+ static int
+-apt_install(char *const argv[])
++watched_cl_auth_status(id self, SEL cmd)
+ {
+-	int install = 0;
++	return 3; /* kCLAuthorizationStatusAuthorizedWhenInUse */
++}
++
++static int
++watched_cl_accuracy_auth(id self, SEL cmd)
++{
++	return 0; /* CLAccuracyAuthorizationFullAccuracy */
++}
+ 
+-	if (argv == NULL || argv[0] == NULL || strcmp(argv[0], "apt-get") != 0) {
+-		return 0;
++static void
++watched_cl_request_when_in_use(id self, SEL cmd)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: CLLocationManager requestWhenInUseAuthorization called\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++
++	id (*get_del)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	id delegate = get_del ? get_del(self, sel_registerName("delegate")) : nil;
++	if (delegate) {
++		dispatch_async(dispatch_get_main_queue(), ^{
++			void (*send_auth)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
++			void (*send_status)(id, SEL, id, int) = (void (*)(id, SEL, id, int))objc_msgSend;
++			if (responds_to(delegate, "locationManagerDidChangeAuthorization:")) {
++				send_auth(delegate, sel_registerName("locationManagerDidChangeAuthorization:"), self);
++			}
++			if (responds_to(delegate, "locationManager:didChangeAuthorizationStatus:")) {
++				send_status(delegate, sel_registerName("locationManager:didChangeAuthorizationStatus:"), self, 3);
++			}
++		});
++	}
++}
++
++static void
++watched_cl_request_always(id self, SEL cmd)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: CLLocationManager requestAlwaysAuthorization called\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++
++	id (*get_del)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	id delegate = get_del ? get_del(self, sel_registerName("delegate")) : nil;
++	if (delegate) {
++		dispatch_async(dispatch_get_main_queue(), ^{
++			void (*send_auth)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
++			void (*send_status)(id, SEL, id, int) = (void (*)(id, SEL, id, int))objc_msgSend;
++			if (responds_to(delegate, "locationManagerDidChangeAuthorization:")) {
++				send_auth(delegate, sel_registerName("locationManagerDidChangeAuthorization:"), self);
++			}
++			if (responds_to(delegate, "locationManager:didChangeAuthorizationStatus:")) {
++				send_status(delegate, sel_registerName("locationManager:didChangeAuthorizationStatus:"), self, 3);
++			}
++		});
++	}
++}
++
++static void
++watched_cl_start_updating_location(id self, SEL cmd)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: CLLocationManager startUpdatingLocation called\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++}
++
++/* AppTrackingTransparency hooks */
++typedef void (^ATTCompletionHandler)(unsigned long status);
++
++static void
++watched_att_request(id self, SEL cmd, id completion)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: ATTrackingManager requestTrackingAuthorization called\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (completion) {
++		ATTCompletionHandler copied = (ATTCompletionHandler)Block_copy(completion);
++		dispatch_async(dispatch_get_main_queue(), ^{
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: auto-answering ATTrackingManager (Authorized)\n", who);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++			copied(3); /* ATTrackingManagerAuthorizationStatusAuthorized */
++			Block_release(copied);
++		});
++	}
++}
++
++/* AVFoundation & Photos hooks */
++typedef void (^AVAccessCompletionHandler)(Boolean granted);
++
++static void
++watched_av_request_access(id self, SEL cmd, id mediaType, id handler)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: AVCaptureDevice requestAccessForMediaType called\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (handler) {
++		AVAccessCompletionHandler copied = (AVAccessCompletionHandler)Block_copy(handler);
++		dispatch_async(dispatch_get_main_queue(), ^{
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: auto-granting AVCaptureDevice access\n", who);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++			copied(true);
++			Block_release(copied);
++		});
++	}
++}
++
++typedef void (^PHAuthCompletionHandler)(long status);
++
++static void
++watched_ph_request_auth(id self, SEL cmd, id handler)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: PHPhotoLibrary requestAuthorization called\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (handler) {
++		PHAuthCompletionHandler copied = (PHAuthCompletionHandler)Block_copy(handler);
++		dispatch_async(dispatch_get_main_queue(), ^{
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: auto-granting PHPhotoLibrary authorization\n", who);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++			copied(3); /* PHAuthorizationStatusAuthorized */
++			Block_release(copied);
++		});
+ 	}
+-	for (int i = 1; argv[i] != NULL; i++) {
+-		if (argv[i][0] == '-' && argv[i][1] == 's') {
+-			return 0;
++}
++
++static void
++watched_ph_request_auth_level(id self, SEL cmd, long level, id handler)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: PHPhotoLibrary requestAuthorizationForAccessLevel:%ld called\n", who, level);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (handler) {
++		PHAuthCompletionHandler copied = (PHAuthCompletionHandler)Block_copy(handler);
++		dispatch_async(dispatch_get_main_queue(), ^{
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: auto-granting PHPhotoLibrary access level\n", who);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++			copied(3); /* PHAuthorizationStatusAuthorized */
++			Block_release(copied);
++		});
++	}
++}
++
++/* Instagram specific IGNetworkInfo hooks */
++static Boolean
++watched_IGNetworkInfo_isOnWifiNetwork(id self, SEL cmd)
++{
++	return true;
++}
++
++static Boolean
++watched_IGNetworkInfo_isReachableViaWiFi(id self, SEL cmd)
++{
++	return true;
++}
++
++static Boolean
++watched_IGNetworkInfo_isReachableViaWWAN(id self, SEL cmd)
++{
++	return false;
++}
++
++static id
++watched_IGNetworkInfo_connectionTypeString(id self, SEL cmd)
++{
++	return (id)CFSTR("wifi");
++}
++
++static id
++watched_IGNetworkInfo_fbConnectionTypeString(id self, SEL cmd)
++{
++	return (id)CFSTR("WIFI");
++}
++
++static id
++watched_IGNetworkInfo_networkReachabilityStatus(id self, SEL cmd)
++{
++	return (id)CFSTR("ReachableViaWiFi");
++}
++
++/* Instagram NUX Transition View Controller auto-advancement hook */
++static void (*orig_trans_view_did_appear)(id, SEL, Boolean);
++static void
++watched_trans_view_did_appear(id self, SEL cmd, Boolean animated)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: IGSessionlessNUXTransitionViewController viewDidAppear!\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (orig_trans_view_did_appear) {
++		orig_trans_view_did_appear(self, cmd, animated);
++	}
++	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
++		id (*get_del)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++		id delegate = get_del ? get_del(self, sel_registerName("delegate")) : nil;
++		char l2[256];
++		int n2 = snprintf(l2, sizeof(l2), "hakios: %s: IGSessionlessNUXTransitionViewController completing transition (delegate=%p)!\n", who, (void*)delegate);
++		say(l2, (size_t)(n2 > 0 ? n2 : 0));
++		if (delegate) {
++			if (responds_to(delegate, "transitionViewControllerDidCompleteTimer")) {
++				void (*send_timer)(id, SEL) = (void (*)(id, SEL))objc_msgSend;
++				send_timer(delegate, sel_registerName("transitionViewControllerDidCompleteTimer"));
++			}
+ 		}
+-		install |= strcmp(argv[i], "install") == 0;
++	});
++}
++
++
++/* Instagram OneTap Step Controller hooks */
++static void (*orig_onetap_skip)(id, SEL);
++static void
++watched_onetap_skip(id self, SEL cmd)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: IGNUXOneTapStepController oneTapControllerSkipButtonTapped called!\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (orig_onetap_skip) {
++		orig_onetap_skip(self, cmd);
+ 	}
+-	return install;
++	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
++		id (*get_del)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++		id delegate = get_del ? get_del(self, sel_registerName("delegate")) : nil;
++		if (!delegate && responds_to(self, "stepCoordinator")) {
++			delegate = get_del(self, sel_registerName("stepCoordinator"));
++		}
++		if (!delegate && responds_to(self, "flowCoordinator")) {
++			delegate = get_del(self, sel_registerName("flowCoordinator"));
++		}
++		char l2[256];
++		int n2 = snprintf(l2, sizeof(l2), "hakios: %s: oneTapControllerSkip advancing delegate %p\n", who, (void*)delegate);
++		say(l2, (size_t)(n2 > 0 ? n2 : 0));
++		if (delegate) {
++			void (*send_comp)(id, SEL, id, id, Boolean, Boolean) = (void (*)(id, SEL, id, id, Boolean, Boolean))objc_msgSend;
++			void (*send_comp2)(id, SEL, id, Boolean) = (void (*)(id, SEL, id, Boolean))objc_msgSend;
++			void (*send_comp1)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
++			if (responds_to(delegate, "stepControllerDidCompleteStep:withTask:success:skippedStep:")) {
++				send_comp(delegate, sel_registerName("stepControllerDidCompleteStep:withTask:success:skippedStep:"), self, nil, true, true);
++			} else if (responds_to(delegate, "stepControllerDidCompleteStep:stepSuccessful:")) {
++				send_comp2(delegate, sel_registerName("stepControllerDidCompleteStep:stepSuccessful:"), self, true);
++			} else if (responds_to(delegate, "stepControllerDidCompleteStep:")) {
++				send_comp1(delegate, sel_registerName("stepControllerDidCompleteStep:"), self);
++			}
++		}
++	});
+ }
+ 
+-/*
+- * What apt says goes to Sileo, which shows a line of it at most. Run the same apt-get, with the same
+- * descriptors, credential and environment, under a shell that first says on the console who it runs
+- * as, what lies in apt's archives and what Sileo's index says of the package, and afterwards how apt
+- * ended and what the archives hold then. This is how "Unable to fetch some archives" was found: the
+- * archives were empty, Sileo's /bin/mv having never run.
+- */
+-static int
+-spawn_apt_said(pid_t *pid, const posix_spawn_file_actions_t *actions, const posix_spawnattr_t *attr,
+-    char *const argv[], char *const envp[])
+-{
+-	static char script[] =
+-	    "exec 7>/dev/console; J=/var/jb\n"
+-	    "echo \"hakios: apt-get runs as $($J/usr/bin/id), in $(pwd)\" >&7\n"
+-	    "$J/bin/ls -ln $J/var/cache/apt/archives $J/var/lib/apt/sileolists >&7 2>&1\n"
+-	    "for a in \"$@\"; do case $a in -*|install) ;; *) p=${a%%=*}\n"
+-	    "  echo \"hakios: $p in sileolists:\" >&7\n"
+-	    "  $J/usr/bin/grep -h -A30 \"^Package: $p\\$\" $J/var/lib/apt/sileolists/*Packages 2>&1 | $J/usr/bin/head -40 >&7 ;; esac; done\n"
+-	    "$J/usr/bin/apt-get \"$@\"\n"
+-	    "s=$?; echo \"hakios: apt-get exits $s; its archives after:\" >&7\n"
+-	    "$J/bin/ls -ln $J/var/cache/apt/archives >&7 2>&1; exit $s\n";
+-	char *wrapped[96];
+-	int k = 0;
+-
+-	for (int i = 0; envp != NULL && envp[i] != NULL; i++) {
+-		char line[600];
+-		int n = snprintf(line, sizeof(line), "hakios: %s: apt-get's environment: %s\n", who, envp[i]);
+-
+-		say(line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
+-	}
+-	wrapped[k++] = "sh";
+-	wrapped[k++] = "-c";
+-	wrapped[k++] = script;
+-	wrapped[k++] = "apt-get";
+-	for (int i = 1; argv[i] != NULL && k < 95; i++) {
+-		wrapped[k++] = argv[i];
+-	}
+-	wrapped[k] = NULL;
+-	return posix_spawn(pid, "/var/jb/bin/sh", actions, attr, wrapped, envp);
++static void (*orig_onetap_next)(id, SEL);
++static void
++watched_onetap_next(id self, SEL cmd)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: IGNUXOneTapStepController oneTapControllerNextButtonTapped called!\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (orig_onetap_next) {
++		orig_onetap_next(self, cmd);
++	}
++	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(400 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
++		id (*get_del)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++		id delegate = get_del ? get_del(self, sel_registerName("delegate")) : nil;
++		if (!delegate && responds_to(self, "stepCoordinator")) {
++			delegate = get_del(self, sel_registerName("stepCoordinator"));
++		}
++		if (!delegate && responds_to(self, "flowCoordinator")) {
++			delegate = get_del(self, sel_registerName("flowCoordinator"));
++		}
++		char l2[256];
++		int n2 = snprintf(l2, sizeof(l2), "hakios: %s: oneTapControllerNext advancing delegate %p\n", who, (void*)delegate);
++		say(l2, (size_t)(n2 > 0 ? n2 : 0));
++		if (delegate) {
++			void (*send_comp)(id, SEL, id, id, Boolean, Boolean) = (void (*)(id, SEL, id, id, Boolean, Boolean))objc_msgSend;
++			void (*send_comp2)(id, SEL, id, Boolean) = (void (*)(id, SEL, id, Boolean))objc_msgSend;
++			void (*send_comp1)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
++			if (responds_to(delegate, "stepControllerDidCompleteStep:withTask:success:skippedStep:")) {
++				send_comp(delegate, sel_registerName("stepControllerDidCompleteStep:withTask:success:skippedStep:"), self, nil, true, false);
++			} else if (responds_to(delegate, "stepControllerDidCompleteStep:stepSuccessful:")) {
++				send_comp2(delegate, sel_registerName("stepControllerDidCompleteStep:stepSuccessful:"), self, true);
++			} else if (responds_to(delegate, "stepControllerDidCompleteStep:")) {
++				send_comp1(delegate, sel_registerName("stepControllerDidCompleteStep:"), self);
++			}
++		}
++	});
++}
++
++static void (*orig_reg_onetap_view_did_appear)(id, SEL, Boolean);
++static void
++watched_reg_onetap_view_did_appear(id self, SEL cmd, Boolean animated)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: IGRegistrationOneTapViewController viewDidAppear!\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (orig_reg_onetap_view_did_appear) {
++		orig_reg_onetap_view_did_appear(self, cmd, animated);
++	}
++}
++
++static void (*orig_nux_interstitial_skip)(id, SEL, id);
++static void
++watched_nux_interstitial_skip(id self, SEL cmd, id sender)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: nuxInterstitialViewDidTapSkip called!\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (orig_nux_interstitial_skip) {
++		orig_nux_interstitial_skip(self, cmd, sender);
++	}
++	if (responds_to(self, "oneTapControllerSkipButtonTapped")) {
++		void (*call_skip)(id, SEL) = (void (*)(id, SEL))objc_msgSend;
++		call_skip(self, sel_registerName("oneTapControllerSkipButtonTapped"));
++	}
++}
++
++static void (*orig_nux_interstitial_next)(id, SEL, id);
++static void
++watched_nux_interstitial_next(id self, SEL cmd, id sender)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: nuxInterstitialViewDidTapNext called!\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (orig_nux_interstitial_next) {
++		orig_nux_interstitial_next(self, cmd, sender);
++	}
++	if (responds_to(self, "oneTapControllerNextButtonTapped")) {
++		void (*call_next)(id, SEL) = (void (*)(id, SEL))objc_msgSend;
++		call_next(self, sel_registerName("oneTapControllerNextButtonTapped"));
++	}
++}
++
++/* Instagram Location Services Upsell auto-dismiss hook */
++static void (*orig_loc_view_did_appear)(id, SEL, Boolean);
++static void
++watched_loc_view_did_appear(id self, SEL cmd, Boolean animated)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: IGNUXLocationServicesViewController viewDidAppear!\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	if (orig_loc_view_did_appear) {
++		orig_loc_view_did_appear(self, cmd, animated);
++	}
++	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
++		id (*get_del)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++		id delegate = get_del ? get_del(self, sel_registerName("delegate")) : nil;
++		if (delegate) {
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: auto-dismissing IGNUXLocationServices (delegate=%p)\n", who, (void*)delegate);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++			if (responds_to(delegate, "locationServicesUpsellViewDidTapDismissButton:")) {
++				void (*dismiss_fn)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
++				dismiss_fn(delegate, sel_registerName("locationServicesUpsellViewDidTapDismissButton:"), nil);
++			}
++		}
++	});
++}
++
++static void
++keep_to_the_repositories(void)
++{
++	CFPreferencesSetAppValue(CFSTR("ShowProvisional"), kCFBooleanFalse, CFSTR("org.coolstar.SileoStore"));
++	CFPreferencesAppSynchronize(CFSTR("org.coolstar.SileoStore"));
++}
++
++static void (*move_url)(id, SEL, id, id, id *);
++static void (*copy_url)(id, SEL, id, id, id *);
++static void (*move_path)(id, SEL, id, id, id *);
++static void (*copy_path)(id, SEL, id, id, id *);
++
++static void
++show_error(const char *name, id error)
++{
++	id (*desc)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
++	id str = error != NULL ? desc(error, sel_registerName("localizedDescription")) : NULL;
++	const char *s = str != NULL ? utf8(str, sel_registerName("UTF8String")) : NULL;
++	char line[500];
++	int n = snprintf(line, sizeof(line), "hakios: %s: NSFileManager %s: %s\n", who, name, s != NULL ? s : "(null)");
++
++	say(line, (size_t)(n > 0 ? n : 0));
++}
++
++static void
++watched_move_url(id self, SEL cmd, id from, id to, id *error)
++{
++	move_url(self, cmd, from, to, error);
++	if (error != NULL && *error != NULL) {
++		show_error("moveItemAtURL", *error);
++	}
++}
++
++static void
++watched_copy_url(id self, SEL cmd, id from, id to, id *error)
++{
++	copy_url(self, cmd, from, to, error);
++	if (error != NULL && *error != NULL) {
++		show_error("copyItemAtURL", *error);
++	}
++}
++
++static void
++watched_move_path(id self, SEL cmd, id from, id to, id *error)
++{
++	move_path(self, cmd, from, to, error);
++	if (error != NULL && *error != NULL) {
++		show_error("moveItemAtPath", *error);
++	}
++}
++
++static void
++watched_copy_path(id self, SEL cmd, id from, id to, id *error)
++{
++	copy_path(self, cmd, from, to, error);
++	if (error != NULL && *error != NULL) {
++		show_error("copyItemAtPath", *error);
++	}
+ }
+ 
+-/*
+- * Every program the application starts, with its arguments. Sileo does everything to the system by
+- * spawning its set-user-ID helper, which execs apt or dpkg; the arguments are the whole question
+- * when apt's answer to Sileo differs from apt's answer on the command line.
+- */
+ static int
+ watched_spawn(pid_t *pid, const char *path, const posix_spawn_file_actions_t *actions,
+     const posix_spawnattr_t *attr, char *const argv[], char *const envp[])
+ {
+-	char line[1200];
+-	int n = snprintf(line, sizeof(line), "hakios: %s: (uid %d) spawns %s", who, (int)getuid(),
+-	    path != NULL ? path : "?");
+-
+-	for (int i = 0; argv != NULL && argv[i] != NULL && n < (int)sizeof(line) - 40; i++) {
+-		n += snprintf(line + n, sizeof(line) - (size_t)n, " %s", argv[i]);
+-	}
+-	/*
+-	 * The size of what it is about to move, while the file is still there: apt refuses the
+-	 * package Sileo puts in its archives ("Unable to fetch some archives") and takes the very
+-	 * same package when apt itself fetched it, so the first thing to know is whether the file
+-	 * is whole.
+-	 */
+-	if (argv != NULL && argv[0] != NULL && strcmp(argv[0], "mv") == 0 && argv[1] != NULL) {
+-		struct stat st;
+-
+-		if (stat(argv[1], &st) == 0) {
+-			n += snprintf(line + n, sizeof(line) - (size_t)n, " [%lld bytes]", (long long)st.st_size);
+-		} else {
+-			n += snprintf(line + n, sizeof(line) - (size_t)n, " [no such file]");
++	static const char *const deny[] = {
++		"/usr/bin/dpkg",
++		"/usr/bin/dpkg-deb",
++		"/redwood/bin/dpkg",
++		"/redwood/bin/dpkg-deb",
++	};
++	char line[500];
++	int n;
++
++	for (unsigned i = 0; i < sizeof(deny) / sizeof(deny[0]); i++) {
++		if (strcmp(path, deny[i]) == 0) {
++			n = snprintf(line, sizeof(line),
++			    "hakios: %s: denying posix_spawn(%s) so the prefix does not break itself\n", who, path);
++			say(line, (size_t)(n > 0 ? n : 0));
++			return EPERM;
+ 		}
+ 	}
+-	n += snprintf(line + n, sizeof(line) - (size_t)n, "\n");
+-	say(line, (size_t)n);
+-	if (apt_install(argv)) {
+-		return spawn_apt_said(pid, actions, attr, argv, envp);
++	return posix_spawn(pid, path, actions, attr, argv, envp);
++}
++
++/*
++ * Fallback keychain cache for third-party apps running without entitlements.
++ * In stock iOS without proper entitlements or daemon, SecItemCopyMatching,
++ * SecItemAdd, and SecItemUpdate fail with -34018 (errSecMissingEntitlement).
++ * We maintain an in-memory & file-backed fallback cache so credentials persist
++ * across app launches and login sessions.
++ */
++static CFMutableArrayRef g_keychain_cache = NULL;
++static const char *g_keychain_file = "/private/var/mobile/Library/Preferences/com.hakios.keychain_fallback.plist";
++
++static void
++apply_dict_entry(const void *key, const void *val, void *context)
++{
++	CFMutableDictionaryRef target = (CFMutableDictionaryRef)context;
++	CFDictionarySetValue(target, key, val);
++}
++
++static void
++init_keychain_cache(void)
++{
++	if (g_keychain_cache != NULL) {
++		return;
++	}
++	CFURLRef file_url = CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault,
++	    (const UInt8 *)g_keychain_file, strlen(g_keychain_file), false);
++	if (file_url) {
++		CFReadStreamRef stream = CFReadStreamCreateWithFile(kCFAllocatorDefault, file_url);
++		if (stream && CFReadStreamOpen(stream)) {
++			CFPropertyListRef plist = CFPropertyListCreateWithStream(kCFAllocatorDefault, stream,
++			    0, kCFPropertyListMutableContainersAndLeaves, NULL, NULL);
++			if (plist && CFGetTypeID(plist) == CFArrayGetTypeID()) {
++				g_keychain_cache = (CFMutableArrayRef)plist;
++			}
++			CFReadStreamClose(stream);
++		}
++		if (stream) CFRelease(stream);
++		CFRelease(file_url);
+ 	}
+-	n = posix_spawn(pid, path, actions, attr, argv, envp);
+-	if (n != 0) {
+-		char said[300];
+-		int k = snprintf(said, sizeof(said), "hakios: %s: ... and that spawn failed: %s\n", who, strerror(n));
++	if (g_keychain_cache == NULL) {
++		g_keychain_cache = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
++	}
++}
+ 
+-		say(said, (size_t)(k < (int)sizeof(said) ? k : (int)sizeof(said) - 1));
++static void
++save_keychain_cache(void)
++{
++	if (g_keychain_cache == NULL) {
++		return;
++	}
++	mkdir("/private/var/mobile/Library/Preferences", 0755);
++	CFURLRef file_url = CFURLCreateFromFileSystemRepresentation(kCFAllocatorDefault,
++	    (const UInt8 *)g_keychain_file, strlen(g_keychain_file), false);
++	if (file_url) {
++		CFWriteStreamRef stream = CFWriteStreamCreateWithFile(kCFAllocatorDefault, file_url);
++		if (stream && CFWriteStreamOpen(stream)) {
++			CFPropertyListWrite(g_keychain_cache, stream, kCFPropertyListBinaryFormat_v1_0, 0, NULL);
++			CFWriteStreamClose(stream);
++		}
++		if (stream) CFRelease(stream);
++		CFRelease(file_url);
+ 	}
+-	return n;
+ }
+ 
+-/*
+- * A file the application moves or copies itself (NSFileManager, under Swift's FileManager), when it
+- * fails: from where, to where, and what the error says. Sileo moves each download into place this
+- * way, and says only "The operation couldn't be completed. No such file or directory".
+- */
+-static const char *
+-text_of(id object)
++static CFDataRef
++make_persistent_ref(CFDictionaryRef dict)
+ {
+-	id (*get)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+-	const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
+-	id text;
++	CFStringRef service = CFDictionaryGetValue(dict, kSecAttrService);
++	CFStringRef account = CFDictionaryGetValue(dict, kSecAttrAccount);
++	if (!service) {
++		service = CFDictionaryGetValue(dict, kSecAttrServer);
++	}
++	if (!service) {
++		service = CFSTR("unknown_service");
++	}
++	if (!account) {
++		account = CFSTR("unknown_account");
++	}
++	char buf[256];
++	CFStringGetCString(service, buf, sizeof(buf), kCFStringEncodingUTF8);
++	char buf2[256];
++	CFStringGetCString(account, buf2, sizeof(buf2), kCFStringEncodingUTF8);
++	char combined[512];
++	int len = snprintf(combined, sizeof(combined), "%s:%s", buf, buf2);
++	return CFDataCreate(kCFAllocatorDefault, (const UInt8 *)combined, len > 0 ? len : 0);
++}
+ 
+-	if (object == NULL) {
+-		return "(nil)";
++static Boolean
++item_matches_query(CFDictionaryRef item, CFDictionaryRef query)
++{
++	const void *keys[] = {
++		kSecClass,
++		kSecAttrAccount,
++		kSecAttrService,
++		kSecAttrServer,
++		kSecAttrAccessGroup
++	};
++	for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
++		const void *q_val = CFDictionaryGetValue(query, keys[i]);
++		if (q_val != NULL) {
++			const void *i_val = CFDictionaryGetValue(item, keys[i]);
++			if (i_val == NULL || !CFEqual(q_val, i_val)) {
++				return false;
++			}
++		}
+ 	}
+-	text = (class_respondsToSelector(object_getClass(object), sel_registerName("path")) ?
+-	    get(object, sel_registerName("path")) : get(object, sel_registerName("description")));
+-	return text != NULL ? utf8(text, sel_registerName("UTF8String")) : "?";
++	return true;
+ }
+ 
+-static signed char (*move_url)(id, SEL, id, id, id *), (*copy_url)(id, SEL, id, id, id *);
+-static signed char (*move_path)(id, SEL, id, id, id *), (*copy_path)(id, SEL, id, id, id *);
++static CFDictionaryRef
++build_query_result_item(CFDictionaryRef item, CFDictionaryRef query)
++{
++	Boolean returnData = CFDictionaryContainsKey(query, kSecReturnData) &&
++	    CFBooleanGetValue((CFBooleanRef)CFDictionaryGetValue(query, kSecReturnData));
++	Boolean returnAttributes = CFDictionaryContainsKey(query, kSecReturnAttributes) &&
++	    CFBooleanGetValue((CFBooleanRef)CFDictionaryGetValue(query, kSecReturnAttributes));
++	Boolean returnRef = CFDictionaryContainsKey(query, kSecReturnPersistentRef) &&
++	    CFBooleanGetValue((CFBooleanRef)CFDictionaryGetValue(query, kSecReturnPersistentRef));
++
++	if (returnData && !returnAttributes && !returnRef) {
++		CFDataRef data = CFDictionaryGetValue(item, kSecValueData);
++		return data ? (CFDictionaryRef)CFRetain(data) : NULL;
++	}
++	if (returnRef && !returnData && !returnAttributes) {
++		return (CFDictionaryRef)make_persistent_ref(item);
++	}
++
++	CFMutableDictionaryRef result = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, item);
++	if (result) {
++		if (returnRef) {
++			CFDataRef pref = make_persistent_ref(item);
++			if (pref) {
++				CFDictionarySetValue(result, kSecValuePersistentRef, pref);
++				CFRelease(pref);
++			}
++		}
++		if (!returnData) {
++			CFDictionaryRemoveValue(result, kSecValueData);
++		}
++	}
++	return result;
++}
+ 
+-static signed char
+-file_said(const char *what, signed char ok, id from, id to, id error)
++static OSStatus
++watched_SecItemCopyMatching(CFDictionaryRef query, CFTypeRef *result)
+ {
+-	if (!ok) {
+-		char line[1400];
+-		int n = snprintf(line, sizeof(line), "hakios: %s: %s %s -> %s failed: %s\n", who, what, text_of(from),
+-		    text_of(to), error != NULL ? text_of(error) : "(no error given)");
++	OSStatus status = SecItemCopyMatching(query, result);
++	char line[512];
++	int n = snprintf(line, sizeof(line), "hakios: %s: SecItemCopyMatching returned %d\n", who, (int)status);
++	say(line, (size_t)(n > 0 ? n : 0));
++
++	if (query) {
++		CFStringRef cls = CFDictionaryGetValue(query, kSecClass);
++		CFStringRef svc = CFDictionaryGetValue(query, kSecAttrService);
++		if (!svc) svc = CFDictionaryGetValue(query, kSecAttrServer);
++		CFStringRef acc = CFDictionaryGetValue(query, kSecAttrAccount);
++		char c_buf[64] = "?", s_buf[128] = "?", a_buf[128] = "?";
++		if (cls) CFStringGetCString(cls, c_buf, sizeof(c_buf), kCFStringEncodingUTF8);
++		if (svc) CFStringGetCString(svc, s_buf, sizeof(s_buf), kCFStringEncodingUTF8);
++		if (acc) CFStringGetCString(acc, a_buf, sizeof(a_buf), kCFStringEncodingUTF8);
++		n = snprintf(line, sizeof(line), "hakios: %s: SecItemCopyMatching query: cls=%s svc/srvr='%s' acc='%s'\n",
++		    who, c_buf, s_buf, a_buf);
++		say(line, (size_t)(n > 0 ? n : 0));
++	}
++
++	if (status != errSecSuccess) {
++		init_keychain_cache();
++		Boolean returnData = CFDictionaryContainsKey(query, kSecReturnData) &&
++		    CFBooleanGetValue((CFBooleanRef)CFDictionaryGetValue(query, kSecReturnData));
++		Boolean returnAttributes = CFDictionaryContainsKey(query, kSecReturnAttributes) &&
++		    CFBooleanGetValue((CFBooleanRef)CFDictionaryGetValue(query, kSecReturnAttributes));
++		Boolean returnRef = CFDictionaryContainsKey(query, kSecReturnPersistentRef) &&
++		    CFBooleanGetValue((CFBooleanRef)CFDictionaryGetValue(query, kSecReturnPersistentRef));
++		const void *matchLimit = CFDictionaryGetValue(query, kSecMatchLimit);
++		Boolean matchAll = (matchLimit && CFEqual(matchLimit, kSecMatchLimitAll));
++
++		CFMutableArrayRef matches = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
++		CFIndex count = CFArrayGetCount(g_keychain_cache);
++		for (CFIndex i = 0; i < count; i++) {
++			CFDictionaryRef item = (CFDictionaryRef)CFArrayGetValueAtIndex(g_keychain_cache, i);
++			if (item_matches_query(item, query)) {
++				CFTypeRef resItem = build_query_result_item(item, query);
++				if (resItem) {
++					CFArrayAppendValue(matches, resItem);
++					CFRelease(resItem);
++				}
++				if (!matchAll) break;
++			}
++		}
+ 
+-		say(line, (size_t)(n < (int)sizeof(line) ? n : (int)sizeof(line) - 1));
++		CFIndex num_matches = CFArrayGetCount(matches);
++		if (num_matches > 0) {
++			n = snprintf(line, sizeof(line), "hakios: %s: SecItemCopyMatching satisfied from fallback cache! (found %ld)\n",
++			    who, num_matches);
++			say(line, (size_t)(n > 0 ? n : 0));
++			if (result != NULL) {
++				if (matchAll) {
++					*result = (CFTypeRef)CFRetain(matches);
++				} else {
++					*result = (CFTypeRef)CFRetain(CFArrayGetValueAtIndex(matches, 0));
++				}
++			}
++			CFRelease(matches);
++			return errSecSuccess;
++		}
++		CFRelease(matches);
++	}
++	if (status != errSecSuccess) {
++		return errSecItemNotFound; /* -25300: not found, avoids fatal -34018 entitlement error */
+ 	}
+-	return ok;
++	return status;
+ }
+ 
+-static signed char
+-watched_move_url(id self, SEL cmd, id from, id to, id *error)
++static OSStatus
++watched_SecItemAdd(CFDictionaryRef attributes, CFTypeRef *result)
+ {
+-	id mine = NULL;
+-	signed char ok = move_url(self, cmd, from, to, error != NULL ? error : &mine);
++	OSStatus status = SecItemAdd(attributes, result);
++	char line[512];
++	int n = snprintf(line, sizeof(line), "hakios: %s: SecItemAdd returned %d\n", who, (int)status);
++	say(line, (size_t)(n > 0 ? n : 0));
++
++	init_keychain_cache();
++	CFIndex count = CFArrayGetCount(g_keychain_cache);
++	for (CFIndex i = 0; i < count; i++) {
++		CFDictionaryRef existing = (CFDictionaryRef)CFArrayGetValueAtIndex(g_keychain_cache, i);
++		if (item_matches_query(existing, attributes)) {
++			CFArrayRemoveValueAtIndex(g_keychain_cache, i);
++			break;
++		}
++	}
++
++	CFMutableDictionaryRef copy = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, attributes);
++	CFArrayAppendValue(g_keychain_cache, copy);
++	CFRelease(copy);
++	save_keychain_cache();
+ 
+-	return file_said("moveItemAtURL", ok, from, to, error != NULL ? *error : mine);
++	n = snprintf(line, sizeof(line), "hakios: %s: SecItemAdd saved item in persistent fallback cache!\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++
++	if (status != errSecSuccess) {
++		if (result != NULL) {
++			*result = make_persistent_ref(attributes);
++		}
++		return errSecSuccess;
++	}
++	return status;
+ }
+ 
+-static signed char
+-watched_copy_url(id self, SEL cmd, id from, id to, id *error)
++static OSStatus
++watched_SecItemUpdate(CFDictionaryRef query, CFDictionaryRef attributesToUpdate)
+ {
+-	id mine = NULL;
+-	signed char ok = copy_url(self, cmd, from, to, error != NULL ? error : &mine);
++	OSStatus status = SecItemUpdate(query, attributesToUpdate);
++	char line[512];
++	int n = snprintf(line, sizeof(line), "hakios: %s: SecItemUpdate returned %d\n", who, (int)status);
++	say(line, (size_t)(n > 0 ? n : 0));
+ 
+-	return file_said("copyItemAtURL", ok, from, to, error != NULL ? *error : mine);
++	init_keychain_cache();
++	CFIndex count = CFArrayGetCount(g_keychain_cache);
++	Boolean updated = false;
++	for (CFIndex i = 0; i < count; i++) {
++		CFDictionaryRef item = (CFDictionaryRef)CFArrayGetValueAtIndex(g_keychain_cache, i);
++		if (item_matches_query(item, query)) {
++			CFMutableDictionaryRef mut = CFDictionaryCreateMutableCopy(kCFAllocatorDefault, 0, item);
++			if (mut) {
++				if (attributesToUpdate) {
++					CFDictionaryApplyFunction(attributesToUpdate, (CFDictionaryApplierFunction)apply_dict_entry, mut);
++				}
++				CFArraySetValueAtIndex(g_keychain_cache, i, mut);
++				CFRelease(mut);
++				updated = true;
++			}
++			break;
++		}
++	}
++	if (updated) {
++		save_keychain_cache();
++		n = snprintf(line, sizeof(line), "hakios: %s: SecItemUpdate updated item in persistent fallback cache!\n", who);
++		say(line, (size_t)(n > 0 ? n : 0));
++		return errSecSuccess;
++	}
++	if (status != errSecSuccess) {
++		return errSecItemNotFound;
++	}
++	return status;
+ }
+ 
+-static signed char
+-watched_move_path(id self, SEL cmd, id from, id to, id *error)
++static OSStatus
++watched_SecItemDelete(CFDictionaryRef query)
+ {
+-	id mine = NULL;
+-	signed char ok = move_path(self, cmd, from, to, error != NULL ? error : &mine);
++	OSStatus status = SecItemDelete(query);
++	char line[512];
++	int n = snprintf(line, sizeof(line), "hakios: %s: SecItemDelete returned %d\n", who, (int)status);
++	say(line, (size_t)(n > 0 ? n : 0));
+ 
+-	return file_said("moveItemAtPath", ok, from, to, error != NULL ? *error : mine);
++	init_keychain_cache();
++	CFIndex count = CFArrayGetCount(g_keychain_cache);
++	Boolean removed = false;
++	for (CFIndex i = count - 1; i >= 0; i--) {
++		CFDictionaryRef item = (CFDictionaryRef)CFArrayGetValueAtIndex(g_keychain_cache, i);
++		if (item_matches_query(item, query)) {
++			CFArrayRemoveValueAtIndex(g_keychain_cache, i);
++			removed = true;
++		}
++	}
++	if (removed) {
++		save_keychain_cache();
++		n = snprintf(line, sizeof(line), "hakios: %s: SecItemDelete removed item from persistent fallback cache!\n", who);
++		say(line, (size_t)(n > 0 ? n : 0));
++		return errSecSuccess;
++	}
++	if (status != errSecSuccess) {
++		return errSecSuccess;
++	}
++	return status;
+ }
+ 
+-static signed char
+-watched_copy_path(id self, SEL cmd, id from, id to, id *error)
++/* SystemConfiguration & Network reachability interpositions */
++typedef struct {
++	SCNetworkReachabilityRef target;
++	SCNetworkReachabilityCallBack callback;
++	SCNetworkReachabilityContext context;
++	dispatch_queue_t queue;
++	CFRunLoopRef runLoop;
++	CFStringRef runLoopMode;
++} tracked_reachability_t;
++
++static tracked_reachability_t g_reachabilities[16];
++static int g_num_reachabilities = 0;
++
++static Boolean
++watched_SCNetworkReachabilityGetFlags(SCNetworkReachabilityRef target, SCNetworkReachabilityFlags *flags)
++{
++	if (flags != NULL) {
++		*flags = kSCNetworkReachabilityFlagsReachable |
++		         kSCNetworkReachabilityFlagsIsDirect;
++	}
++	return true;
++}
++
++static Boolean
++watched_SCNetworkReachabilitySetCallback(SCNetworkReachabilityRef target,
++    SCNetworkReachabilityCallBack callout, SCNetworkReachabilityContext *context)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: SCNetworkReachabilitySetCallback registered (%p)\n", who, (void*)callout);
++	say(line, (size_t)(n > 0 ? n : 0));
++
++	for (int i = 0; i < g_num_reachabilities; i++) {
++		if (g_reachabilities[i].target == target) {
++			g_reachabilities[i].callback = callout;
++			if (context) g_reachabilities[i].context = *context;
++			return true;
++		}
++	}
++	if (g_num_reachabilities < 16) {
++		g_reachabilities[g_num_reachabilities].target = target;
++		g_reachabilities[g_num_reachabilities].callback = callout;
++		if (context) g_reachabilities[g_num_reachabilities].context = *context;
++		g_reachabilities[g_num_reachabilities].queue = NULL;
++		g_reachabilities[g_num_reachabilities].runLoop = NULL;
++		g_num_reachabilities++;
++	}
++	return true;
++}
++
++static Boolean
++watched_SCNetworkReachabilitySetDispatchQueue(SCNetworkReachabilityRef target, dispatch_queue_t queue)
+ {
+-	id mine = NULL;
+-	signed char ok = copy_path(self, cmd, from, to, error != NULL ? error : &mine);
++	SCNetworkReachabilityCallBack cb = NULL;
++	void *info = NULL;
+ 
+-	return file_said("copyItemAtPath", ok, from, to, error != NULL ? *error : mine);
++	for (int i = 0; i < g_num_reachabilities; i++) {
++		if (g_reachabilities[i].target == target) {
++			g_reachabilities[i].queue = queue;
++			cb = g_reachabilities[i].callback;
++			info = g_reachabilities[i].context.info;
++			break;
++		}
++	}
++
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: SCNetworkReachabilitySetDispatchQueue (queue=%p, cb=%p)\n",
++	    who, (void*)queue, (void*)cb);
++	say(line, (size_t)(n > 0 ? n : 0));
++
++	if (queue && cb) {
++		dispatch_async(queue, ^{
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: dispatching SCNetworkReachability callback (reachable)\n", who);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++			SCNetworkReachabilityFlags flags = kSCNetworkReachabilityFlagsReachable | kSCNetworkReachabilityFlagsIsDirect;
++			cb(target, flags, info);
++		});
++	}
++	return true;
+ }
+ 
+-__attribute__((used)) static struct {
++static Boolean
++watched_SCNetworkReachabilityScheduleWithRunLoop(SCNetworkReachabilityRef target, CFRunLoopRef runLoop, CFStringRef runLoopMode)
++{
++	SCNetworkReachabilityCallBack cb = NULL;
++	void *info = NULL;
++
++	for (int i = 0; i < g_num_reachabilities; i++) {
++		if (g_reachabilities[i].target == target) {
++			g_reachabilities[i].runLoop = runLoop;
++			g_reachabilities[i].runLoopMode = runLoopMode;
++			cb = g_reachabilities[i].callback;
++			info = g_reachabilities[i].context.info;
++			break;
++		}
++	}
++
++	if (cb) {
++		dispatch_async(dispatch_get_main_queue(), ^{
++			SCNetworkReachabilityFlags flags = kSCNetworkReachabilityFlagsReachable | kSCNetworkReachabilityFlagsIsDirect;
++			cb(target, flags, info);
++		});
++	}
++	return true;
++}
++
++static nw_path_status_t
++watched_nw_path_get_status(nw_path_t path)
++{
++	return nw_path_status_satisfied;
++}
++
++static bool
++watched_nw_path_is_expensive(nw_path_t path)
++{
++	return false;
++}
++
++static bool
++watched_nw_path_is_constrained(nw_path_t path)
++{
++	return false;
++}
++
++static bool
++watched_nw_path_has_ipv4(nw_path_t path)
++{
++	return true;
++}
++
++static bool
++watched_nw_path_has_dns(nw_path_t path)
++{
++	return true;
++}
++
++static bool
++watched_nw_path_uses_interface_type(nw_path_t path, nw_interface_type_t interface_type)
++{
++	return (interface_type == nw_interface_type_wifi);
++}
++
++typedef struct {
++	nw_path_monitor_t monitor;
++	nw_path_monitor_update_handler_t update_handler;
++	dispatch_queue_t queue;
++	bool started;
++} tracked_nw_monitor_t;
++
++static tracked_nw_monitor_t g_nw_monitors[16];
++static int g_num_nw_monitors = 0;
++
++static void
++watched_nw_path_monitor_set_queue(nw_path_monitor_t monitor, dispatch_queue_t queue)
++{
++	nw_path_monitor_set_queue(monitor, queue);
++	for (int i = 0; i < g_num_nw_monitors; i++) {
++		if (g_nw_monitors[i].monitor == monitor) {
++			g_nw_monitors[i].queue = queue;
++			return;
++		}
++	}
++	if (g_num_nw_monitors < 16) {
++		g_nw_monitors[g_num_nw_monitors].monitor = monitor;
++		g_nw_monitors[g_num_nw_monitors].queue = queue;
++		g_nw_monitors[g_num_nw_monitors].update_handler = NULL;
++		g_nw_monitors[g_num_nw_monitors].started = false;
++		g_num_nw_monitors++;
++	}
++}
++
++static void
++watched_nw_path_monitor_set_update_handler(nw_path_monitor_t monitor, nw_path_monitor_update_handler_t update_handler)
++{
++	nw_path_monitor_set_update_handler(monitor, update_handler);
++	nw_path_monitor_update_handler_t copied = update_handler ? Block_copy(update_handler) : NULL;
++	for (int i = 0; i < g_num_nw_monitors; i++) {
++		if (g_nw_monitors[i].monitor == monitor) {
++			if (g_nw_monitors[i].update_handler) {
++				Block_release(g_nw_monitors[i].update_handler);
++			}
++			g_nw_monitors[i].update_handler = copied;
++			if (g_nw_monitors[i].started && copied) {
++				dispatch_queue_t q = g_nw_monitors[i].queue ? g_nw_monitors[i].queue : dispatch_get_main_queue();
++				dispatch_async(q, ^{
++					copied((nw_path_t)monitor);
++				});
++			}
++			return;
++		}
++	}
++	if (g_num_nw_monitors < 16) {
++		g_nw_monitors[g_num_nw_monitors].monitor = monitor;
++		g_nw_monitors[g_num_nw_monitors].update_handler = copied;
++		g_nw_monitors[g_num_nw_monitors].queue = NULL;
++		g_nw_monitors[g_num_nw_monitors].started = false;
++		g_num_nw_monitors++;
++	}
++}
++
++static void
++watched_nw_path_monitor_start(nw_path_monitor_t monitor)
++{
++	char line[256];
++	int n = snprintf(line, sizeof(line), "hakios: %s: nw_path_monitor_start called\n", who);
++	say(line, (size_t)(n > 0 ? n : 0));
++	nw_path_monitor_start(monitor);
++
++	for (int i = 0; i < g_num_nw_monitors; i++) {
++		if (g_nw_monitors[i].monitor == monitor) {
++			g_nw_monitors[i].started = true;
++			dispatch_queue_t q = g_nw_monitors[i].queue ? g_nw_monitors[i].queue : dispatch_get_main_queue();
++			nw_path_monitor_update_handler_t handler = g_nw_monitors[i].update_handler;
++			if (handler) {
++				dispatch_async(q, ^{
++					char l2[256];
++					int n2 = snprintf(l2, sizeof(l2), "hakios: %s: triggering nw_path_monitor update_handler (satisfied)\n", who);
++					say(l2, (size_t)(n2 > 0 ? n2 : 0));
++					handler((nw_path_t)monitor);
++				});
++			}
++			return;
++		}
++	}
++	if (g_num_nw_monitors < 16) {
++		g_nw_monitors[g_num_nw_monitors].monitor = monitor;
++		g_nw_monitors[g_num_nw_monitors].started = true;
++		g_nw_monitors[g_num_nw_monitors].queue = NULL;
++		g_nw_monitors[g_num_nw_monitors].update_handler = NULL;
++		g_num_nw_monitors++;
++	}
++}
++
++typedef struct {
+ 	const void *ours, *theirs;
+-} spawn_interpose __attribute__((section("__DATA,__interpose"))) = {
+-	(const void *)watched_spawn, (const void *)posix_spawn
++} interpose_entry_t;
++
++__attribute__((used)) static const interpose_entry_t app_interposes[] __attribute__((section("__DATA,__interpose"))) = {
++	{ (const void *)watched_spawn, (const void *)posix_spawn },
++	{ (const void *)watched_SecItemCopyMatching, (const void *)SecItemCopyMatching },
++	{ (const void *)watched_SecItemAdd, (const void *)SecItemAdd },
++	{ (const void *)watched_SecItemUpdate, (const void *)SecItemUpdate },
++	{ (const void *)watched_SecItemDelete, (const void *)SecItemDelete },
++	{ (const void *)watched_SCNetworkReachabilityGetFlags, (const void *)SCNetworkReachabilityGetFlags },
++	{ (const void *)watched_SCNetworkReachabilitySetCallback, (const void *)SCNetworkReachabilitySetCallback },
++	{ (const void *)watched_SCNetworkReachabilitySetDispatchQueue, (const void *)SCNetworkReachabilitySetDispatchQueue },
++	{ (const void *)watched_SCNetworkReachabilityScheduleWithRunLoop, (const void *)SCNetworkReachabilityScheduleWithRunLoop },
++	{ (const void *)watched_nw_path_get_status, (const void *)nw_path_get_status },
++	{ (const void *)watched_nw_path_is_expensive, (const void *)nw_path_is_expensive },
++	{ (const void *)watched_nw_path_is_constrained, (const void *)nw_path_is_constrained },
++	{ (const void *)watched_nw_path_has_ipv4, (const void *)nw_path_has_ipv4 },
++	{ (const void *)watched_nw_path_has_dns, (const void *)nw_path_has_dns },
++	{ (const void *)watched_nw_path_uses_interface_type, (const void *)nw_path_uses_interface_type },
++	{ (const void *)watched_nw_path_monitor_set_queue, (const void *)nw_path_monitor_set_queue },
++	{ (const void *)watched_nw_path_monitor_set_update_handler, (const void *)nw_path_monitor_set_update_handler },
++	{ (const void *)watched_nw_path_monitor_start, (const void *)nw_path_monitor_start },
+ };
+ 
+ /* Put ours in the place of a method, keeping the one that was there. */
+@@ -328,10 +1256,39 @@ watch(const char *name, const char *selector, IMP ours, void *theirs)
+ 	Method method = class != NULL ? class_getInstanceMethod(class, sel_registerName(selector)) : NULL;
+ 
+ 	if (method != NULL && method_getImplementation(method) != ours) {
+-		*(IMP *)theirs = method_setImplementation(method, ours);
++		IMP old = method_setImplementation(method, ours);
++		if (theirs) *(IMP *)theirs = old;
++	}
++}
++
++static void
++watch_class(const char *name, const char *selector, IMP ours, void *theirs)
++{
++	Class class = objc_getClass(name);
++	Method method = class != NULL ? class_getClassMethod(class, sel_registerName(selector)) : NULL;
++
++	if (method != NULL && method_getImplementation(method) != ours) {
++		IMP old = method_setImplementation(method, ours);
++		if (theirs) *(IMP *)theirs = old;
+ 	}
+ }
+ 
++typedef void NSUncaughtExceptionHandler(id);
++
++static void
++hakios_uncaught_exception(id exception)
++{
++	id (*desc)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
++	const char *(*utf8)(id, SEL) = (const char *(*)(id, SEL))objc_msgSend;
++	id name = desc ? desc(exception, sel_registerName("name")) : nil;
++	id reason = desc ? desc(exception, sel_registerName("reason")) : nil;
++	char line[1024];
++	int n = snprintf(line, sizeof(line), "hakios: %s: UNCAUGHT EXCEPTION: %s: %s\n", who,
++		name ? utf8(name, sel_registerName("UTF8String")) : "?",
++		reason ? utf8(reason, sel_registerName("UTF8String")) : "?");
++	say(line, (size_t)(n > 0 ? n : 0));
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_app_init(void)
+@@ -347,11 +1304,11 @@ hakios_app_init(void)
+ 		return;
+ 	}
+ 	who = name;
++	void (*set_handler)(NSUncaughtExceptionHandler *) = (void (*)(NSUncaughtExceptionHandler *))dlsym(RTLD_DEFAULT, "NSSetUncaughtExceptionHandler");
++	if (set_handler) {
++		set_handler(hakios_uncaught_exception);
++	}
+ 	slide = (uintptr_t)_dyld_get_shared_cache_range(&length) - CACHE_BASE;
+-	/*
+-	 * An application's standard error goes nowhere here, and that is where the Swift runtime says
+-	 * what it is about to die of ("Fatal error: ..."), so it is pointed at the console.
+-	 */
+ 	console = open("/dev/console", O_WRONLY);
+ 	if (console >= 0) {
+ 		dup2(console, 2);
+@@ -362,19 +1319,79 @@ hakios_app_init(void)
+ 	for (unsigned i = 0; i < sizeof(signals) / sizeof(signals[0]); i++) {
+ 		sigaction(signals[i], &action, NULL);
+ 	}
++
++	/* Load dynamic frameworks so classes can be hooked */
++	dlopen("/System/Library/Frameworks/UserNotifications.framework/UserNotifications", RTLD_LAZY);
++	dlopen("/System/Library/Frameworks/Contacts.framework/Contacts", RTLD_LAZY);
++	dlopen("/System/Library/Frameworks/CoreLocation.framework/CoreLocation", RTLD_LAZY);
++	dlopen("/System/Library/Frameworks/AppTrackingTransparency.framework/AppTrackingTransparency", RTLD_LAZY);
++	dlopen("/System/Library/Frameworks/AVFoundation.framework/AVFoundation", RTLD_LAZY);
++	dlopen("/System/Library/Frameworks/Photos.framework/Photos", RTLD_LAZY);
++
++	/* Hook authorization dialogs that would otherwise hang waiting for missing system daemons */
++	watch("UNUserNotificationCenter", "requestAuthorizationWithOptions:completionHandler:", (IMP)watched_un_request_auth, &orig_un_req);
++	watch("UNUserNotificationCenter", "getNotificationSettingsWithCompletionHandler:", (IMP)watched_un_get_settings, NULL);
++	watch("UNNotificationSettings", "authorizationStatus", (IMP)watched_un_settings_auth_status, NULL);
++	watch("UNNotificationSettings", "notificationCenterSetting", (IMP)watched_un_settings_enabled, NULL);
++	watch("UNNotificationSettings", "soundSetting", (IMP)watched_un_settings_enabled, NULL);
++	watch("UNNotificationSettings", "badgeSetting", (IMP)watched_un_settings_enabled, NULL);
++	watch("UNNotificationSettings", "alertSetting", (IMP)watched_un_settings_enabled, NULL);
++	watch("UNNotificationSettings", "alertStyle", (IMP)watched_un_settings_alert_style, NULL);
++
++	watch("CNContactStore", "requestAccessForEntityType:completionHandler:", (IMP)watched_cn_request_access, &orig_cn_req);
++	watch_class("CNContactStore", "authorizationStatusForEntityType:", (IMP)watched_cn_auth_status, NULL);
++
++	watch_class("CLLocationManager", "locationServicesEnabled", (IMP)watched_cl_location_services_enabled, NULL);
++	watch_class("CLLocationManager", "authorizationStatus", (IMP)watched_cl_auth_status, NULL);
++	watch("CLLocationManager", "authorizationStatus", (IMP)watched_cl_auth_status, NULL);
++	watch("CLLocationManager", "accuracyAuthorization", (IMP)watched_cl_accuracy_auth, NULL);
++	watch("CLLocationManager", "requestWhenInUseAuthorization", (IMP)watched_cl_request_when_in_use, NULL);
++	watch("CLLocationManager", "requestAlwaysAuthorization", (IMP)watched_cl_request_always, NULL);
++	watch("CLLocationManager", "startUpdatingLocation", (IMP)watched_cl_start_updating_location, NULL);
++
++	watch_class("ATTrackingManager", "requestTrackingAuthorizationWithCompletionHandler:", (IMP)watched_att_request, NULL);
++	watch_class("AVCaptureDevice", "requestAccessForMediaType:completionHandler:", (IMP)watched_av_request_access, NULL);
++	watch_class("PHPhotoLibrary", "requestAuthorization:", (IMP)watched_ph_request_auth, NULL);
++	watch_class("PHPhotoLibrary", "requestAuthorizationForAccessLevel:handler:", (IMP)watched_ph_request_auth_level, NULL);
++
++	/* Watch background tasks and session tasks across all apps */
++	watch("UIApplication", "beginBackgroundTaskWithExpirationHandler:", (IMP)watched_begin_task, &begin_task);
++	watch("UIApplication", "beginBackgroundTaskWithName:expirationHandler:", (IMP)watched_begin_task_name, &begin_task_name);
++	watch("NSURLSessionTask", "resume", (IMP)watched_resume_task, &resume_task);
++
++	if (strcmp(name, "Instagram") == 0) {
++		dispatch_async(dispatch_get_main_queue(), ^{
++			watch("IGNetworkInfo", "isOnWifiNetwork", (IMP)watched_IGNetworkInfo_isOnWifiNetwork, NULL);
++			watch("IGNetworkInfo", "isReachableViaWiFi", (IMP)watched_IGNetworkInfo_isReachableViaWiFi, NULL);
++			watch("IGNetworkInfo", "isReachableViaWWAN", (IMP)watched_IGNetworkInfo_isReachableViaWWAN, NULL);
++			watch("IGNetworkInfo", "connectionTypeString", (IMP)watched_IGNetworkInfo_connectionTypeString, NULL);
++			watch("IGNetworkInfo", "fbConnectionTypeString", (IMP)watched_IGNetworkInfo_fbConnectionTypeString, NULL);
++			watch("IGNetworkInfo", "networkReachabilityStatus", (IMP)watched_IGNetworkInfo_networkReachabilityStatus, NULL);
++
++			watch("_TtC30IGSessionlessNUXTransitionView40IGSessionlessNUXTransitionViewController", "viewDidAppear:", (IMP)watched_trans_view_did_appear, &orig_trans_view_did_appear);
++			watch("_TtC21IGNUXLocationServices35IGNUXLocationServicesViewController", "viewDidAppear:", (IMP)watched_loc_view_did_appear, &orig_loc_view_did_appear);
++
++			watch("IGNUXOneTapStepController", "oneTapControllerSkipButtonTapped", (IMP)watched_onetap_skip, &orig_onetap_skip);
++			watch("IGNUXOneTapStepController", "oneTapControllerNextButtonTapped", (IMP)watched_onetap_next, &orig_onetap_next);
++			watch("IGNUXOneTapStepController", "nuxInterstitialViewDidTapSkip:", (IMP)watched_nux_interstitial_skip, &orig_nux_interstitial_skip);
++			watch("IGNUXOneTapStepController", "nuxInterstitialViewDidTapNext:", (IMP)watched_nux_interstitial_next, &orig_nux_interstitial_next);
++			watch("IGRegistrationOneTapViewController", "viewDidAppear:", (IMP)watched_reg_onetap_view_did_appear, &orig_reg_onetap_view_did_appear);
++			watch("IGRegistrationOneTapViewController", "nuxInterstitialViewDidTapSkip:", (IMP)watched_nux_interstitial_skip, &orig_nux_interstitial_skip);
++			watch("IGRegistrationOneTapViewController", "nuxInterstitialViewDidTapNext:", (IMP)watched_nux_interstitial_next, &orig_nux_interstitial_next);
++
++			char l2[256];
++			int n2 = snprintf(l2, sizeof(l2), "hakios: %s: Instagram NUX & Network hooks registered on main queue\n", who);
++			say(l2, (size_t)(n2 > 0 ? n2 : 0));
++		});
++	}
++
+ 	if (strcmp(name, "Sileo") == 0) {
+ 		dispatch_async(dispatch_get_main_queue(), ^{ keep_to_the_repositories(); });
++		watch("NSFileManager", "moveItemAtURL:toURL:error:", (IMP)watched_move_url, &move_url);
++		watch("NSFileManager", "copyItemAtURL:toURL:error:", (IMP)watched_copy_url, &copy_url);
++		watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
++		watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
+ 	}
+-	watch("UIApplication", "beginBackgroundTaskWithExpirationHandler:", (IMP)watched_begin_task, &begin_task);
+-	/*
+-	 * NSURLSessionTask alone: its subclasses inherit the very same method, and watching it twice
+-	 * would leave ours as the "original" of itself -- a call that never returns.
+-	 */
+-	watch("NSURLSessionTask", "resume", (IMP)watched_resume_task, &resume_task);
+-	watch("NSFileManager", "moveItemAtURL:toURL:error:", (IMP)watched_move_url, &move_url);
+-	watch("NSFileManager", "copyItemAtURL:toURL:error:", (IMP)watched_copy_url, &copy_url);
+-	watch("NSFileManager", "moveItemAtPath:toPath:error:", (IMP)watched_move_path, &move_path);
+-	watch("NSFileManager", "copyItemAtPath:toPath:error:", (IMP)watched_copy_path, &copy_path);
+ 	n = snprintf(line, sizeof(line), "hakios: %s: started as uid %d (effective %d), watching for what kills it\n",
+ 	    name, (int)getuid(), (int)geteuid());
+ 	say(line, (size_t)(n > 0 ? n : 0));
+diff --git a/userland/src/inject_sb.c b/userland/src/inject_sb.c
+index 4426541..b0eac20 100644
+--- a/userland/src/inject_sb.c
++++ b/userland/src/inject_sb.c
+@@ -350,14 +350,7 @@ sysctl_int(const char *name)
+ static bool
+ battery_power_source(void)
+ {
+-	static bool found;
+-	io_service_t service;
+-
+-	if (!found && (service = IOServiceGetMatchingService(0, IOServiceMatching("HakiosBattery"))) != 0) {
+-		IOObjectRelease(service);
+-		found = true;
+-	}
+-	return found;
++	return false;
+ }
+ 
+ /* ---- the cellular items of the status bar, from the kernel's modem ------------------------------ */
+@@ -534,6 +527,8 @@ signal_view_hook(void)
+ 	}
+ }
+ 
++static void update_oled_dimmer(double b);
++
+ static void
+ cellular_hook(void)
+ {
+@@ -609,20 +604,116 @@ cellular_hook(void)
+ 				say("hakios: cellular: the signal item asked to update (registered %d, bars %d)\n", registered, bars);
+ 			}
+ 		}
++		if (cellular_aggregator != nil) {
++			SEL updateBatt = sel_registerName("_updateBatteryItems");
++			if (class_getInstanceMethod(object_getClass(cellular_aggregator), updateBatt)) {
++				((void (*)(id, SEL))objc_msgSend)(cellular_aggregator, updateBatt);
++			}
++		}
++		Class scrCls = objc_getClass("UIScreen");
++		if (scrCls) {
++			id screen = ((id (*)(Class, SEL))objc_msgSend)(scrCls, sel_registerName("mainScreen"));
++			if (screen) {
++				static double last_b = -1.0;
++				double curB = ((double (*)(id, SEL))objc_msgSend)(screen, sel_registerName("brightness"));
++				if (curB >= 0.0 && curB <= 1.0 && curB != last_b) {
++					last_b = curB;
++					update_oled_dimmer(curB);
++				}
++			}
++		}
+ 	});
+ 	dispatch_resume(timer);
+ }
+ 
+ /* UIDevice.batteryLevel: 0.0..1.0; -1.0 if monitoring not enabled */
++
++
++static void (*orig_setBrightness)(id, SEL, double) = NULL;
++static void my_setBrightness(id self, SEL sel, double b)
++{
++	if (orig_setBrightness) orig_setBrightness(self, sel, b);
++	update_oled_dimmer(b);
++}
++
++static bool is_cc_brightness_slider(id view)
++{
++	id cur = view;
++	bool saw_brightness = false;
++	for (int depth = 0; cur && depth < 7; depth++) {
++		const char *cname = object_getClassName(cur);
++		if (cname) {
++			if (strstr(cname, "Volume") || strstr(cname, "Audio") || strstr(cname, "Media") || strstr(cname, "Ringer")) {
++				return false;
++			}
++			if (strstr(cname, "Brightness") || strstr(cname, "Display")) {
++				saw_brightness = true;
++			}
++		}
++		SEL vcSel = sel_registerName("_viewControllerForAncestor");
++		if (depth == 0 && class_getInstanceMethod(object_getClass(cur), vcSel)) {
++			id vc = ((id (*)(id, SEL))objc_msgSend)(cur, vcSel);
++			if (vc) {
++				const char *vcName = object_getClassName(vc);
++				if (vcName) {
++					if (strstr(vcName, "Volume") || strstr(vcName, "Audio") || strstr(vcName, "Media")) {
++						return false;
++					}
++					if (strstr(vcName, "Brightness") || strstr(vcName, "Display")) {
++						saw_brightness = true;
++					}
++				}
++			}
++		}
++		SEL superSel = sel_registerName("superview");
++		cur = class_getInstanceMethod(object_getClass(cur), superSel) ? ((id (*)(id, SEL))objc_msgSend)(cur, superSel) : NULL;
++	}
++	return saw_brightness;
++}
++
++static void (*orig_slider_setValue)(id, SEL, float) = NULL;
++static void my_slider_setValue(id self, SEL sel, float val)
++{
++	if (orig_slider_setValue) orig_slider_setValue(self, sel, val);
++	if (is_cc_brightness_slider(self) && val >= 0.0f && val <= 1.0f) {
++		update_oled_dimmer((double)val);
++	}
++}
++
++/* Hardware Exynos DSIM AMOLED Brightness Control via kern.hakios.brightness */
++static void update_oled_dimmer(double b)
++{
++	if (b < 0.0) b = 0.0;
++	if (b > 1.0) b = 1.0;
++	int level = (int)(b * 255.0 + 0.5);
++	if (level < 0) level = 0;
++	if (level > 255) level = 255;
++	static int last_level = -1;
++	if (level == last_level) return;
++	last_level = level;
++	sysctlbyname("kern.hakios.brightness", NULL, NULL, &level, sizeof(level));
++}
++
++
++static BOOL
++ringer_is_muted(__unused id self, __unused SEL sel)
++{
++	return NO;
++}
++
++static void
++ringer_set_muted(__unused id self, __unused SEL sel, __unused BOOL muted)
++{
++}
++
+ static float
+ battery_level(id self, SEL sel)
+ {
+ 	int soc = sysctl_int("kern.hakios.battery_soc");
+-	float orig = original_battery_level ? original_battery_level(self, sel) : -1.0f;
+ 
+-	if (orig >= 0.0f) return orig;
+ 	if (soc >= 0 && soc <= 100) return (float)soc / 100.0f;
+-	return -1.0f;
++	float orig = original_battery_level ? original_battery_level(self, sel) : -1.0f;
++	return orig >= 0.0f ? orig : 0.85f;
+ }
+ 
+ /* UIDevice.batteryState: 0=unknown 1=unplugged 2=charging 3=full */
+@@ -633,12 +724,14 @@ battery_state(id self, SEL sel)
+ 	int present = sysctl_int("kern.hakios.battery_present");
+ 	int plugged = sysctl_int("kern.hakios.battery_charger_present");
+ 	int soc = sysctl_int("kern.hakios.battery_soc");
+-	long orig = original_battery_state ? original_battery_state(self, sel) : 0;
+ 
+-	if (orig > 0) return orig;
+-	if (!present) return 0;
+-	if (plugged && soc >= 100) return 3;
+-	return (charging || plugged) ? 2 : 1;
++	if (present > 0 || plugged > 0 || charging > 0 || (soc >= 0 && soc <= 100)) {
++		if (plugged && soc >= 100) return 3;
++		if (charging || plugged) return 2;
++		return 1;
++	}
++	long orig = original_battery_state ? original_battery_state(self, sel) : 0;
++	return orig > 0 ? orig : 1;
+ }
+ 
+ /*
+@@ -647,20 +740,17 @@ battery_state(id self, SEL sel)
+  * turns on (SBShowBatteryPercentage in userland/var/mobile/Library/Preferences/com.apple.springboard.plist).
+  */
+ static BOOL
+-battery_view_shows_percentage(id self, SEL sel)
++battery_view_shows_percentage(__unused id self, __unused SEL sel)
+ {
+-	int soc = sysctl_int("kern.hakios.battery_soc");
+-
+-	if (soc >= 0 && soc <= 100) return YES;
+-	return original_battery_view_shows_percentage ? original_battery_view_shows_percentage(self, sel) : YES;
++	return YES;
+ }
+ 
+ static void
+-battery_view_set_shows_percentage(id self, SEL sel, BOOL shows)
++battery_view_set_shows_percentage(id self, SEL sel, __unused BOOL shows)
+ {
+-	int soc = sysctl_int("kern.hakios.battery_soc");
+-
+-	original_battery_view_set_shows_percentage(self, sel, (soc >= 0 && soc <= 100 && !battery_power_source()) ? YES : shows);
++	if (original_battery_view_set_shows_percentage) {
++		original_battery_view_set_shows_percentage(self, sel, YES);
++	}
+ }
+ 
+ static BOOL
+@@ -669,7 +759,7 @@ battery_view_should_show_bolt(id self, SEL sel)
+ 	int charging = sysctl_int("kern.hakios.battery_charging");
+ 	int plugged = sysctl_int("kern.hakios.battery_charger_present");
+ 
+-	if (plugged && (charging || charging == -1)) return YES;
++	if (plugged > 0 || charging > 0) return YES;
+ 	return original_battery_view_should_show_bolt ? original_battery_view_should_show_bolt(self, sel) : NO;
+ }
+ 
+@@ -685,8 +775,8 @@ battery_view_charge_percent(id self, SEL sel)
+ {
+ 	int soc = sysctl_int("kern.hakios.battery_soc");
+ 
+-	if (soc >= 0 && soc <= 100 && !battery_power_source()) return (double)soc / 100.0;
+-	return original_battery_view_charge_percent ? original_battery_view_charge_percent(self, sel) : 0.0;
++	if (soc >= 0 && soc <= 100) return (double)soc / 100.0;
++	return original_battery_view_charge_percent ? original_battery_view_charge_percent(self, sel) : 0.85;
+ }
+ 
+ static void
+@@ -694,7 +784,7 @@ battery_view_set_charge_percent(id self, SEL sel, double p)
+ {
+ 	int soc = sysctl_int("kern.hakios.battery_soc");
+ 
+-	original_battery_view_set_charge_percent(self, sel, (soc >= 0 && soc <= 100 && !battery_power_source()) ? (double)soc / 100.0 : p);
++	original_battery_view_set_charge_percent(self, sel, (soc >= 0 && soc <= 100) ? (double)soc / 100.0 : (p > 0.0 ? p : 0.85));
+ }
+ 
+ /* The big charging ring on the lock screen (CoverSheet) reads its fill level the same way. */
+@@ -703,8 +793,8 @@ ring_charging_level(id self, SEL sel)
+ {
+ 	int soc = sysctl_int("kern.hakios.battery_soc");
+ 
+-	if (soc >= 0 && soc <= 100 && !battery_power_source()) return (double)soc / 100.0;
+-	return original_ring_charging_level ? original_ring_charging_level(self, sel) : 0.0;
++	if (soc >= 0 && soc <= 100) return (double)soc / 100.0;
++	return original_ring_charging_level ? original_ring_charging_level(self, sel) : 0.85;
+ }
+ 
+ /* Keep SpringBoard's normal battery observers awake while the XNU cache changes. */
+@@ -717,7 +807,7 @@ battery_post_notifications(void)
+ 	id center = notification_center ? ((id (*)(Class, SEL))objc_msgSend)(notification_center,
+ 	    sel_registerName("defaultCenter")) : nil;
+ 
+-	if (center != nil && !battery_power_source()) {
++	if (center != nil && device != nil) {
+ 		SEL post = sel_registerName("postNotificationName:object:");
+ 		((void (*)(id, SEL, id, id))objc_msgSend)(center, post,
+ 		    (id)CFSTR("UIDeviceBatteryLevelDidChangeNotification"), device);
+@@ -929,7 +1019,10 @@ unlock(void)
+ static BOOL
+ poster_switcher_allowed(__unused id self, __unused SEL selector, id *explanation)
+ {
+-	return YES;
++	if (explanation != NULL) {
++		*explanation = (id)CFSTR("the poster switcher is not shown here (see inject_sb.c)");
++	}
++	return NO;
+ }
+ 
+ /*
+@@ -2223,6 +2316,17 @@ hakios_springboard_init(void)
+ 		    sysctl_int("kern.hakios.cellular_registered"), sysctl_int("kern.hakios.cellular_bars"),
+ 		    sysctl_int("kern.hakios.cellular_dbm"), sysctl_int("kern.hakios.cellular_radio"));
+ 	}
++	Class rcCls = objc_getClass("SBRingerControl");
++	if (rcCls) {
++		Method mIsMuted = class_getInstanceMethod(rcCls, sel_registerName("isRingerMuted"));
++		if (mIsMuted) method_setImplementation(mIsMuted, (IMP)ringer_is_muted);
++		Method mSetMuted = class_getInstanceMethod(rcCls, sel_registerName("setRingerMuted:"));
++		if (mSetMuted) method_setImplementation(mSetMuted, (IMP)ringer_set_muted);
++	}
++	int ringerToken = 0;
++	notify_register_check("com.apple.springboard.ringerstate", &ringerToken);
++	notify_set_state(ringerToken, 1);
++	notify_post("com.apple.springboard.ringerstate");
+ 	cellular_hook();
+ 	say("hakios: battery UI: shows%% %s, set-shows%% %s, bolt %s, chargePercent %s, setChargePercent %s, lockscreen ring %s\n",
+ 	    original_battery_view_shows_percentage ? "ok" : "NO",
+@@ -2247,6 +2351,24 @@ hakios_springboard_init(void)
+ 	 * we are past UIApplication startup).
+ 	 */
+ 	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
++		Class scr = objc_getClass("UIScreen");
++		if (scr) {
++			Method m = class_getInstanceMethod(scr, sel_registerName("setBrightness:"));
++			if (m && method_getImplementation(m) != (IMP)my_setBrightness) {
++				orig_setBrightness = (void (*)(id, SEL, double))method_getImplementation(m);
++				method_setImplementation(m, (IMP)my_setBrightness);
++				say("hakios: hooked UIScreen setBrightness:\n");
++			}
++		}
++		Class sliderCls = objc_getClass("CCUIContinuousSliderView");
++		if (sliderCls) {
++			Method m = class_getInstanceMethod(sliderCls, sel_registerName("setValue:"));
++			if (m && method_getImplementation(m) != (IMP)my_slider_setValue) {
++				orig_slider_setValue = (void (*)(id, SEL, float))method_getImplementation(m);
++				method_setImplementation(m, (IMP)my_slider_setValue);
++				say("hakios: hooked CCUIContinuousSliderView setValue:\n");
++			}
++		}
+ 		Class uidev = objc_getClass("UIDevice");
+ 		SEL current = sel_registerName("currentDevice");
+ 		SEL monitoring = sel_registerName("setBatteryMonitoringEnabled:");
+@@ -2268,6 +2390,24 @@ hakios_springboard_init(void)
+ 		    sysctl_int("kern.hakios.battery_soc"), sysctl_int("kern.hakios.battery_present"),
+ 		    sysctl_int("kern.hakios.battery_charger_present"), sysctl_int("kern.hakios.battery_charging"));
+ 		battery_post_notifications();
++		/* Listen for brightness changes and sync hardware DSIM panel */
++		Class screenCls = objc_getClass("UIScreen");
++		id mainScreen = screenCls ? ((id (*)(Class, SEL))objc_msgSend)(screenCls, sel_registerName("mainScreen")) : nil;
++		if (mainScreen) {
++			double initB = ((double (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("brightness"));
++			if (initB > 0.01 && initB <= 1.0) update_oled_dimmer(initB);
++		}
++		Class nc = objc_getClass("NSNotificationCenter");
++		id dCenter = nc ? ((id (*)(Class, SEL))objc_msgSend)(nc, sel_registerName("defaultCenter")) : nil;
++		if (dCenter) {
++			SEL addObs = sel_registerName("addObserverForName:object:queue:usingBlock:");
++			void (^block)(id) = ^(id note) {
++				double b = ((double (*)(id, SEL))objc_msgSend)(mainScreen, sel_registerName("brightness"));
++				if (b >= 0.0 && b <= 1.0) update_oled_dimmer(b);
++			};
++			((void (*)(id, SEL, id, id, id, void (^)(id)))objc_msgSend)(dCenter, addObs,
++			    (id)CFSTR("UIScreenBrightnessDidChangeNotification"), nil, nil, block);
++		}
+ 	});
+ 	notify_register_dispatch("com.hakios.unlock", &token, dispatch_get_main_queue(), ^(__unused int t) {
+ 		unlock();
+diff --git a/userland/src/inject_tweaks.c b/userland/src/inject_tweaks.c
+index af6e9b8..30e4b17 100644
+--- a/userland/src/inject_tweaks.c
++++ b/userland/src/inject_tweaks.c
+@@ -1,3 +1,5 @@
++#include <objc/message.h>
++#include <string.h>
+ /*
+  * libhakios.tweaks.dylib: the tweak loader of this port.
+  *
+@@ -259,6 +261,94 @@ load_the_tweaks(void)
+ 	}
+ }
+ 
++#include <sys/sysctl.h>
++#include <stdlib.h>
++
++static void (*orig_uiscreen_set_brightness)(id, SEL, double);
++static void (*orig_uislider_set_value)(id, SEL, float, BOOL);
++
++static void
++hakios_write_brightness_double(double b)
++{
++	if (b < 0.0) b = 0.0;
++	if (b > 1.0) b = 1.0;
++	int level = (int)(b * 255.0 + 0.5);
++	if (level < 0) level = 0;
++	if (level > 255) level = 255;
++	static int last_level = -1;
++	if (level == last_level) return;
++	last_level = level;
++	sysctlbyname("kern.hakios.brightness", NULL, NULL, &level, sizeof(level));
++}
++
++static void
++pref_uiscreen_set_brightness(id self, SEL sel, double b)
++{
++	if (orig_uiscreen_set_brightness) {
++		orig_uiscreen_set_brightness(self, sel, b);
++	}
++	hakios_write_brightness_double(b);
++}
++
++static bool
++is_brightness_slider(id slider)
++{
++	id cur = slider;
++	for (int depth = 0; cur && depth < 6; depth++) {
++		const char *cname = object_getClassName(cur);
++		if (cname && (strstr(cname, "Brightness") != NULL || strstr(cname, "DBS") != NULL)) {
++			return true;
++		}
++		SEL vcSel = sel_registerName("_viewControllerForAncestor");
++		if (depth == 0 && class_getInstanceMethod(object_getClass(cur), vcSel)) {
++			id vc = ((id (*)(id, SEL))objc_msgSend)(cur, vcSel);
++			if (vc) {
++				const char *vcName = object_getClassName(vc);
++				if (vcName && (strstr(vcName, "Brightness") != NULL || strstr(vcName, "Display") != NULL || strstr(vcName, "DBS") != NULL)) {
++					return true;
++				}
++			}
++		}
++		SEL superSel = sel_registerName("superview");
++		cur = class_getInstanceMethod(object_getClass(cur), superSel) ? ((id (*)(id, SEL))objc_msgSend)(cur, superSel) : NULL;
++	}
++	return false;
++}
++
++static void
++pref_uislider_set_value(id self, SEL sel, float v, BOOL animated)
++{
++	if (orig_uislider_set_value) {
++		orig_uislider_set_value(self, sel, v, animated);
++	}
++	if (is_brightness_slider(self) && v >= 0.0f && v <= 1.0f) {
++		hakios_write_brightness_double((double)v);
++	}
++}
++
++static void
++prefs_brightness_setup(void)
++{
++	const char *prog = getprogname();
++	if (!prog || strcmp(prog, "Preferences") != 0) return;
++	Class screenCls = objc_getClass("UIScreen");
++	if (screenCls) {
++		Method m = class_getInstanceMethod(screenCls, sel_registerName("setBrightness:"));
++		if (m && method_getImplementation(m) != (IMP)pref_uiscreen_set_brightness) {
++			orig_uiscreen_set_brightness = (void (*)(id, SEL, double))method_getImplementation(m);
++			method_setImplementation(m, (IMP)pref_uiscreen_set_brightness);
++		}
++	}
++	Class sliderCls = objc_getClass("UISlider");
++	if (sliderCls) {
++		Method m = class_getInstanceMethod(sliderCls, sel_registerName("setValue:animated:"));
++		if (m && method_getImplementation(m) != (IMP)pref_uislider_set_value) {
++			orig_uislider_set_value = (void (*)(id, SEL, float, BOOL))method_getImplementation(m);
++			method_setImplementation(m, (IMP)pref_uislider_set_value);
++		}
++	}
++}
++
+ __attribute__((constructor))
+ static void
+ hakios_tweaks_init(void)
+@@ -270,4 +360,5 @@ hakios_tweaks_init(void)
+ 	}
+ 	done = true;
+ 	load_the_tweaks();
++	prefs_brightness_setup();
+ }
+diff --git a/userland/src/var_store.c b/userland/src/var_store.c
+index 84f246b..8ffe98c 100644
+--- a/userland/src/var_store.c
++++ b/userland/src/var_store.c
+@@ -49,7 +49,7 @@
+ #define BLOCK           4096
+ #define BUFFER          (4u << 20)              /* the loader's own buffer: one request a write */
+ #define STORE_AT        8589934592LL            /* darwin's block 2097152: past the cryptexes, with room to spare */
+-#define SLOT_BYTES      0x80000000LL            /* 2 GiB a slot, two slots */
++#define SLOT_BYTES      0x3e000000LL            /* 2 GiB a slot, two slots */
+ #define SLOTS           2
+ #define DEVICE          "/dev/rufs_darwin"
+ #define ROOT            "/private/var"
+diff --git a/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c b/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c
+index 4fb7353..7a1d932 100644
+--- a/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c
++++ b/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c
+@@ -1172,9 +1172,9 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
+ 	sp->f_bsize = am->am_nx.block_size ? am->am_nx.block_size : 4096;
+ 	sp->f_iosize = sp->f_bsize;
+ 	/* Provide 40 GB storage capacity with 32 GB available to prevent 'iPhone Storage Full' */
+-	uint64_t target_blocks = (40ULL * 1024 * 1024 * 1024) / sp->f_bsize;
++	uint64_t target_blocks = (128ULL * 1024 * 1024 * 1024) / sp->f_bsize;
+ 	sp->f_blocks = (am->am_nx.block_count > target_blocks) ? am->am_nx.block_count : target_blocks;
+-	uint64_t avail_blocks = (32ULL * 1024 * 1024 * 1024) / sp->f_bsize;
++	uint64_t avail_blocks = (104ULL * 1024 * 1024 * 1024) / sp->f_bsize;
+ 	sp->f_bfree = avail_blocks;
+ 	sp->f_bavail = avail_blocks;
+ 	sp->f_bused = (sp->f_blocks > avail_blocks) ? (sp->f_blocks - avail_blocks) : am->am_vol.alloc_count;
+diff --git a/xnu/files/bsd/miscfs/ramfs/ramfs.c b/xnu/files/bsd/miscfs/ramfs/ramfs.c
+index a822e76..50cd36f 100644
+--- a/xnu/files/bsd/miscfs/ramfs/ramfs.c
++++ b/xnu/files/bsd/miscfs/ramfs/ramfs.c
+@@ -1666,6 +1666,12 @@ ramfs_offtoblk(struct vnop_offtoblk_args *ap)
+ 	return 0;
+ }
+ 
++static int
++ramfs_advlock(__unused struct vnop_advlock_args *ap)
++{
++	return 0;
++}
++
+ #define VOPFUNC int (*)(void *)
+ 
+ int(**ramfs_vnodeop_p)(void *);
+@@ -1703,6 +1709,7 @@ const struct vnodeopv_entry_desc ramfs_vnodeop_entries[] = {
+ 	{ .opve_op = &vnop_listxattr_desc, .opve_impl = (VOPFUNC)ramfs_listxattr },
+ 	{ .opve_op = &vnop_blktooff_desc, .opve_impl = (VOPFUNC)ramfs_blktooff },
+ 	{ .opve_op = &vnop_offtoblk_desc, .opve_impl = (VOPFUNC)ramfs_offtoblk },
++	{ .opve_op = &vnop_advlock_desc, .opve_impl = (VOPFUNC)ramfs_advlock },
+ 	{ .opve_op = (struct vnodeop_desc *)NULL, .opve_impl = (VOPFUNC)NULL }
+ };
+ const struct vnodeopv_desc ramfs_vnodeop_opv_desc = {
+@@ -1748,8 +1755,9 @@ ramfs_mount(mount_t mp, __unused vnode_t devvp, __unused user_addr_t data, __unu
+ 	sp->f_bsize = PAGE_SIZE;
+ 	sp->f_iosize = PAGE_SIZE;
+ 	/* Report 40 GB total with 32 GB free for /private/var ramfs */
+-	sp->f_blocks = (40ULL * 1024 * 1024 * 1024) / PAGE_SIZE;
+-	sp->f_bfree = sp->f_bavail = (32ULL * 1024 * 1024 * 1024) / PAGE_SIZE;
++	/* Report 128 GB total capacity with 104 GB free for Samsung Galaxy A51 UFS 128GB */
++	sp->f_blocks = (128ULL * 1024 * 1024 * 1024) / PAGE_SIZE;
++	sp->f_bfree = sp->f_bavail = (104ULL * 1024 * 1024 * 1024) / PAGE_SIZE;
+ 	sp->f_bused = sp->f_blocks - sp->f_bfree;
+ 	/* there is no table of nodes to run out of; report as many as there could be pages */
+ 	sp->f_files = rm->rm_max_pages;
+@@ -1846,15 +1854,17 @@ ramfs_vfs_getattr(mount_t mp, struct vfs_attr *fsap, __unused vfs_context_t ctx)
+ 	nodes = rm->rm_nodes;
+ 	lck_mtx_unlock(&rm->rm_lock);
+ 
++	uint64_t total_pages = (128ULL * 1024 * 1024 * 1024) / PAGE_SIZE;
++	uint64_t free_pages = ((104ULL * 1024 * 1024 * 1024) / PAGE_SIZE) - MIN(used, (104ULL * 1024 * 1024 * 1024) / PAGE_SIZE);
+ 	VFSATTR_RETURN(fsap, f_objcount, nodes);
+ 	VFSATTR_RETURN(fsap, f_bsize, PAGE_SIZE);
+ 	VFSATTR_RETURN(fsap, f_iosize, PAGE_SIZE);
+-	VFSATTR_RETURN(fsap, f_blocks, rm->rm_max_pages);
+-	VFSATTR_RETURN(fsap, f_bfree, rm->rm_max_pages - MIN(used, rm->rm_max_pages));
+-	VFSATTR_RETURN(fsap, f_bavail, rm->rm_max_pages - MIN(used, rm->rm_max_pages));
+-	VFSATTR_RETURN(fsap, f_bused, used);
+-	VFSATTR_RETURN(fsap, f_files, rm->rm_max_pages);
+-	VFSATTR_RETURN(fsap, f_ffree, rm->rm_max_pages - MIN(nodes, rm->rm_max_pages));
++	VFSATTR_RETURN(fsap, f_blocks, total_pages);
++	VFSATTR_RETURN(fsap, f_bfree, free_pages);
++	VFSATTR_RETURN(fsap, f_bavail, free_pages);
++	VFSATTR_RETURN(fsap, f_bused, total_pages - free_pages);
++	VFSATTR_RETURN(fsap, f_files, total_pages);
++	VFSATTR_RETURN(fsap, f_ffree, free_pages);
+ 
+ 	if (VFSATTR_IS_ACTIVE(fsap, f_capabilities)) {
+ 		vol_capabilities_attr_t *cap = &fsap->f_capabilities;
+diff --git a/xnu/files/bsd/sys/hakios.sta.h b/xnu/files/bsd/sys/hakios.sta.h
+index 8e2c9db..ecca883 100644
+--- a/xnu/files/bsd/sys/hakios.sta.h
++++ b/xnu/files/bsd/sys/hakios.sta.h
+@@ -96,6 +96,8 @@ enum hakios_sta_event {
+ #ifdef KERNEL
+ /* ---- the station side ---- */
+ void     hakios_sta_attach(const struct hakios_sta_ops *ops);         /* NULL: it is going away (waits for a call under way) */
++void     hakios_sta_recovery_begin(void); /* drain callbacks; requests/power remain queued */
++void     hakios_sta_recovery_end(void);   /* resume after transport is ready; rejoin desired network */
+ void     hakios_sta_lost(int error);                                   /* the network joined is gone by itself */
+ 
+ /* ---- who wants a network: each asks and returns; the outcome is an event. 0, or an errno ---- */
+diff --git a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 811bc5c..83f7017 100644
+--- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -222,6 +222,276 @@ SYSCTL_DECL(_kern_hakios);
+ static uint32_t gShownSurface;
+ SYSCTL_UINT(_kern_hakios, OID_AUTO, fb_surface, CTLFLAG_RD | CTLFLAG_LOCKED, &gShownSurface, 0, "the IOSurface last put on the panel");
+ 
++/* ---- Exynos 9611 DSIM MIPI-DCS Panel Brightness Control (SM-A515F S6E3FA9 / EA8076) ---- */
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
++#define A51_DSIM_PA                    0x148E0000UL
++#define A51_DSIM_CONFIG                0x004Cu
++#define A51_DSIM_CONFIG_LANES_EN_MASK  0x001Fu
++#define A51_DSIM_INTSRC                0x0050u
++#define A51_DSIM_PKTHDR                0x0058u
++#define A51_DSIM_PKTHDR_BTA            (1u << 24)
++#define A51_DSIM_PAYLOAD               0x005Cu
++#define A51_DSIM_RXFIFO                0x0060u
++#define A51_DSIM_FIFOCTRL              0x0068u
++
++#define A51_DSIM_FIFOCTRL_INIT_PH      (1u << 0)
++#define A51_DSIM_FIFOCTRL_INIT_PL      (1u << 1)
++#define A51_DSIM_FIFOCTRL_INIT_RX      (1u << 2)
++#define A51_DSIM_FIFO_EMPTY_PL         (1u << 8)
++#define A51_DSIM_FIFO_FULL_PL          (1u << 9)
++#define A51_DSIM_FIFO_EMPTY_PH         (1u << 10)
++#define A51_DSIM_FIFO_FULL_PH          (1u << 11)
++#define A51_DSIM_FIFOCTRL_EMPTY_RX     (1u << 12)
++
++#define A51_DSIM_INTSRC_PH_OVERFLOW    (1u << 27)
++#define A51_DSIM_INTSRC_INVALID_SFR    (1u << 23)
++#define A51_DSIM_INTSRC_ABNORMAL_CMD   (1u << 22)
++#define A51_DSIM_INTSRC_RX_DATA_DONE   (1u << 18)
++#define A51_DSIM_INTSRC_ERR_RX_ECC     (1u << 15)
++#define A51_DSIM_INTSRC_RX_CRC         (1u << 14)
++#define A51_DSIM_INTSRC_ERROR_MASK     (A51_DSIM_INTSRC_PH_OVERFLOW | A51_DSIM_INTSRC_INVALID_SFR | A51_DSIM_INTSRC_ABNORMAL_CMD | A51_DSIM_INTSRC_ERR_RX_ECC | A51_DSIM_INTSRC_RX_CRC)
++
++static const uint16_t a51_panel_gamma_table[256] = {
++    /*   0.. 15 */    3,    6,    9,   12,   15,   18,   21,   24,   27,   30,   33,   36,   39,   42,   45,   48,
++    /*  16.. 31 */   52,   55,   59,   62,   66,   69,   73,   77,   80,   84,   87,   91,   95,   98,  102,  105,
++    /*  32.. 47 */  109,  112,  116,  120,  123,  127,  130,  134,  138,  141,  145,  148,  152,  156,  159,  163,
++    /*  48.. 63 */  166,  170,  173,  177,  181,  184,  188,  191,  195,  199,  202,  206,  209,  213,  216,  220,
++    /*  64.. 79 */  224,  227,  231,  234,  238,  242,  245,  249,  252,  256,  259,  263,  267,  270,  274,  277,
++    /*  80.. 95 */  281,  285,  288,  292,  295,  299,  302,  306,  310,  313,  317,  320,  324,  328,  331,  335,
++    /*  96..111 */  338,  342,  345,  349,  353,  356,  360,  363,  367,  371,  374,  378,  381,  385,  388,  392,
++    /* 112..127 */  396,  399,  403,  406,  410,  414,  417,  421,  424,  428,  431,  435,  439,  442,  446,  449,
++    /* 128..143 */  453,  457,  462,  466,  471,  475,  480,  484,  489,  493,  498,  502,  507,  511,  516,  520,
++    /* 144..159 */  525,  529,  534,  538,  543,  547,  552,  556,  561,  565,  570,  574,  579,  583,  588,  592,
++    /* 160..175 */  597,  601,  606,  610,  615,  619,  624,  628,  633,  637,  641,  646,  650,  655,  659,  664,
++    /* 176..191 */  668,  673,  677,  682,  686,  691,  695,  700,  704,  709,  713,  718,  722,  727,  731,  736,
++    /* 192..207 */  740,  745,  749,  754,  758,  763,  767,  772,  776,  781,  785,  790,  794,  799,  803,  808,
++    /* 208..223 */  812,  817,  821,  826,  830,  834,  839,  843,  848,  852,  857,  861,  866,  870,  875,  879,
++    /* 224..239 */  884,  888,  893,  897,  902,  906,  911,  915,  920,  924,  929,  933,  938,  942,  947,  951,
++    /* 240..255 */  956,  960,  965,  969,  974,  978,  983,  987,  992,  996, 1001, 1005, 1010, 1014, 1018, 1023
++};
++
++static IOLock *gDsimLock = NULL;
++static vm_offset_t gDsimBase = 0;
++static int gBrightnessLevel = 200;
++static bool gDsimCtrlInit = false;
++static bool gDsimClockReady = false;
++
++static bool a51DsimEnsureClock(void)
++{
++    if (gDsimClockReady) return true;
++    vm_offset_t pmu = ml_io_map(0x11860000UL, 0x5000);
++    if (!pmu) return false;
++    if ((*(volatile uint32_t *)(pmu + 0x4004u) & 0xfu) != 0xfu) {
++        return false; /* DISPAUD power domain off (e.g. QEMU) */
++    }
++    vm_offset_t cmu = ml_io_map(0x14980000UL, 0x4000);
++    if (!cmu) return false;
++    static const uint16_t dispGates[] = {
++        0x200c, 0x2044, 0x2050, 0x2054, 0x2060, 0x2064, 0x2068,
++        0x2070, 0x2074, 0x208c, 0x2090, 0x20a8, 0x20ac, 0x20b4
++    };
++    static const uint16_t dispQchs[] = {
++        0x302c, 0x3030, 0x3034, 0x3038, 0x303c, 0x3044, 0x3048, 0x3054, 0x3064
++    };
++    for (unsigned i = 0; i < sizeof(dispGates) / sizeof(dispGates[0]); i++) {
++        volatile uint32_t *reg = (volatile uint32_t *)(cmu + dispGates[i]);
++        *reg = (*reg & ~(1u << 28)) | (3u << 20);
++    }
++    for (unsigned i = 0; i < sizeof(dispQchs) / sizeof(dispQchs[0]); i++) {
++        volatile uint32_t *reg = (volatile uint32_t *)(cmu + dispQchs[i]);
++        *reg = (*reg & ~7u) | 6u;
++    }
++    __asm__ volatile("dsb sy" ::: "memory");
++    gDsimClockReady = true;
++    return true;
++}
++
++static inline uint32_t dsimRead(uint32_t off)
++{
++    return *(volatile uint32_t *)(gDsimBase + off);
++}
++
++static inline void dsimWrite(uint32_t off, uint32_t val)
++{
++    *(volatile uint32_t *)(gDsimBase + off) = val;
++    __asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int a51DsimWaitTxWritable(void)
++{
++    for (int i = 0; i < 2000; i++) {
++        uint32_t f = dsimRead(A51_DSIM_FIFOCTRL);
++        if (!(f & A51_DSIM_FIFO_FULL_PH) && !(f & A51_DSIM_FIFO_FULL_PL)) return 0;
++        IODelay(5);
++    }
++    return -1;
++}
++
++static int a51DsimSendDCS(uint8_t cmd, const uint8_t *payload, uint32_t len)
++{
++    if (!gDsimBase || len > 32) return -1;
++    if (dsimRead(A51_DSIM_INTSRC) & A51_DSIM_INTSRC_ERROR_MASK) {
++        dsimWrite(A51_DSIM_INTSRC, A51_DSIM_INTSRC_ERROR_MASK);
++    }
++    if (a51DsimWaitTxWritable() != 0) {
++        dsimWrite(A51_DSIM_FIFOCTRL, A51_DSIM_FIFOCTRL_INIT_PH | A51_DSIM_FIFOCTRL_INIT_PL);
++        dsimWrite(A51_DSIM_INTSRC, A51_DSIM_INTSRC_ERROR_MASK);
++        return -1;
++    }
++    if (len == 0) {
++        dsimWrite(A51_DSIM_PKTHDR, 0x05u | ((uint32_t)cmd << 8));
++    } else if (len == 1) {
++        dsimWrite(A51_DSIM_PKTHDR, 0x15u | ((uint32_t)cmd << 8) | ((uint32_t)payload[0] << 16));
++    } else {
++        uint32_t word = (uint32_t)cmd;
++        uint32_t shift = 8;
++        for (uint32_t i = 0; i < len; i++) {
++            word |= ((uint32_t)payload[i] << shift);
++            shift += 8;
++            if (shift == 32 || i == len - 1) {
++                dsimWrite(A51_DSIM_PAYLOAD, word);
++                word = 0;
++                shift = 0;
++            }
++        }
++        dsimWrite(A51_DSIM_PKTHDR, 0x39u | ((len + 1u) << 8));
++    }
++    for (int i = 0; i < 2000; i++) {
++        uint32_t intsrc = dsimRead(A51_DSIM_INTSRC);
++        if (intsrc & A51_DSIM_INTSRC_ERROR_MASK) {
++            dsimWrite(A51_DSIM_FIFOCTRL, A51_DSIM_FIFOCTRL_INIT_PH | A51_DSIM_FIFOCTRL_INIT_PL);
++            dsimWrite(A51_DSIM_INTSRC, A51_DSIM_INTSRC_ERROR_MASK);
++            return -1;
++        }
++        uint32_t f = dsimRead(A51_DSIM_FIFOCTRL);
++        if ((f & A51_DSIM_FIFO_EMPTY_PH) && (len < 2 || (f & A51_DSIM_FIFO_EMPTY_PL))) {
++            return 0;
++        }
++        IODelay(5);
++    }
++    dsimWrite(A51_DSIM_FIFOCTRL, A51_DSIM_FIFOCTRL_INIT_PH | A51_DSIM_FIFOCTRL_INIT_PL);
++    return -1;
++}
++
++static int a51DsimReadDCS(uint8_t cmd, uint8_t *rx, uint32_t rxLen, uint32_t *outLen)
++{
++    if (outLen) *outLen = 0;
++    if (!gDsimBase || !rx || !rxLen || rxLen > 16) return -1;
++    dsimWrite(A51_DSIM_INTSRC, A51_DSIM_INTSRC_RX_DATA_DONE | A51_DSIM_INTSRC_ERROR_MASK);
++    dsimWrite(A51_DSIM_FIFOCTRL, A51_DSIM_FIFOCTRL_INIT_RX);
++    if (a51DsimWaitTxWritable() != 0) return -1;
++    dsimWrite(A51_DSIM_PKTHDR, 0x37u | (rxLen << 8));
++    dsimWrite(A51_DSIM_PKTHDR, A51_DSIM_PKTHDR_BTA | 0x06u | ((uint32_t)cmd << 8));
++    int ok = 0;
++    for (int i = 0; i < 2000; i++) {
++        uint32_t intsrc = dsimRead(A51_DSIM_INTSRC);
++        /* Check hardware error bits before RX_DATA_DONE */
++        if (intsrc & A51_DSIM_INTSRC_ERROR_MASK) {
++            dsimWrite(A51_DSIM_FIFOCTRL, A51_DSIM_FIFOCTRL_INIT_PH | A51_DSIM_FIFOCTRL_INIT_PL | A51_DSIM_FIFOCTRL_INIT_RX);
++            dsimWrite(A51_DSIM_INTSRC, A51_DSIM_INTSRC_ERROR_MASK | A51_DSIM_INTSRC_RX_DATA_DONE);
++            return -1;
++        }
++        if (intsrc & A51_DSIM_INTSRC_RX_DATA_DONE) {
++            ok = 1;
++            break;
++        }
++        IODelay(5);
++    }
++    if (!ok || (dsimRead(A51_DSIM_FIFOCTRL) & A51_DSIM_FIFOCTRL_EMPTY_RX)) {
++        dsimWrite(A51_DSIM_FIFOCTRL, A51_DSIM_FIFOCTRL_INIT_RX);
++        return -1;
++    }
++    uint32_t hdr = dsimRead(A51_DSIM_RXFIFO);
++    uint32_t dt = hdr & 0xFFu;
++    if (dt == 0x21u || dt == 0x11u) {
++        rx[0] = (uint8_t)((hdr >> 8) & 0xFFu);
++        if (outLen) *outLen = 1;
++        return 0;
++    } else if (dt == 0x22u || dt == 0x12u) {
++        rx[0] = (uint8_t)((hdr >> 8) & 0xFFu);
++        if (rxLen > 1) rx[1] = (uint8_t)((hdr >> 16) & 0xFFu);
++        if (outLen) *outLen = 2;
++        return 0;
++    } else if (dt == 0x1Cu || dt == 0x1Au) {
++        uint32_t wc = (hdr >> 8) & 0xFFFFu;
++        uint32_t n = wc < rxLen ? wc : rxLen;
++        uint32_t words = (n + 3u) / 4u, copied = 0;
++        for (uint32_t w = 0; w < words; w++) {
++            if (dsimRead(A51_DSIM_FIFOCTRL) & A51_DSIM_FIFOCTRL_EMPTY_RX) return -1;
++            uint32_t wd = dsimRead(A51_DSIM_RXFIFO);
++            for (uint32_t b = 0; b < 4 && copied < n; b++) rx[copied++] = (uint8_t)((wd >> (b * 8)) & 0xFFu);
++        }
++        if (outLen) *outLen = wc;
++        return 0;
++    }
++    return -1;
++}
++
++static void a51DsimProbeInit(void)
++{
++    if (!gDsimLock) gDsimLock = IOLockAlloc();
++    IOLockLock(gDsimLock);
++    if (a51DsimEnsureClock()) {
++        if (!gDsimBase) gDsimBase = ml_io_map(A51_DSIM_PA, 0x1000);
++        if (gDsimBase) {
++            uint32_t cfg = dsimRead(A51_DSIM_CONFIG);
++            IOLog("MiniIOMobileFramebuffer: DSIM config=%#x lanes=%#x\n",
++                  cfg, cfg & A51_DSIM_CONFIG_LANES_EN_MASK);
++        }
++    }
++    IOLockUnlock(gDsimLock);
++}
++
++static int a51DsimSetBrightness(int level)
++{
++    if (level < 0) level = 0;
++    if (level > 255) level = 255;
++    if (!gDsimLock) gDsimLock = IOLockAlloc();
++    IOLockLock(gDsimLock);
++    if (!a51DsimEnsureClock()) {
++        gBrightnessLevel = level;
++        IOLockUnlock(gDsimLock);
++        return 0;
++    }
++    if (!gDsimBase) gDsimBase = ml_io_map(A51_DSIM_PA, 0x1000);
++    if (!gDsimBase || (dsimRead(A51_DSIM_CONFIG) & A51_DSIM_CONFIG_LANES_EN_MASK) == 0) {
++        gBrightnessLevel = level;
++        IOLockUnlock(gDsimLock);
++        return 0;
++    }
++    static const uint8_t keyUnlock[2] = {0x5Au, 0x5Au};
++    static const uint8_t keyLock[2] = {0xA5u, 0xA5u};
++    static const uint8_t ctrlDisp[1] = {0x28u};
++    uint16_t raw = a51_panel_gamma_table[level];
++    uint8_t payload[2] = { (uint8_t)((raw >> 8) & 0x03u), (uint8_t)(raw & 0xFFu) };
++
++    (void)a51DsimSendDCS(0xF0u, keyUnlock, 2);
++    if (!gDsimCtrlInit) {
++        if (a51DsimSendDCS(0x53u, ctrlDisp, 1) == 0) gDsimCtrlInit = true;
++    }
++    int rc = a51DsimSendDCS(0x51u, payload, 2);
++    (void)a51DsimSendDCS(0xF0u, keyLock, 2);
++    if (rc == 0) {
++        gBrightnessLevel = level;
++    }
++    IOLockUnlock(gDsimLock);
++    return rc;
++}
++
++static int a51_brightness_sysctl SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++    int val = gBrightnessLevel;
++    int error = sysctl_handle_int(oidp, &val, 0, req);
++    if (error || !req->newptr) return error;
++    if (val < 0) val = 0;
++    if (val > 255) val = 255;
++    (void)a51DsimSetBrightness(val);
++    return 0;
++}
++
++SYSCTL_PROC(_kern_hakios, OID_AUTO, brightness, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_ANYBODY | CTLFLAG_LOCKED, NULL, 0, a51_brightness_sysctl, "I", "AMOLED panel brightness (0-255)");
++
+ #define SWAP_QUEUE              2                       /* frames that may wait for the panel at most (fb_queue) */
+ static TUNABLE(uint32_t, gQueue, "fb_queue", 2);
+ static inline unsigned
+@@ -526,6 +796,7 @@ public:
+ 	uint32_t        fRecCosted;             /* ... of how many frames: a line every 120 */
+ 
+ 	virtual bool start(IOService * provider) APPLE_KEXT_OVERRIDE;
++	virtual IOReturn setProperties(OSObject * properties) APPLE_KEXT_OVERRIDE;
+ 	void publishModes(void);
+ 	void publishRefresh(void);
+ 	MiniIOSurface * defaultSurface(void);
+@@ -714,6 +985,7 @@ IOMobileFramebuffer::start(IOService * provider)
+ 		thread_deallocate(thread);
+ 	}
+ 	fDecon = deconRegisters();
++	a51DsimProbeInit();
+ 	if (fDecon != 0) {
+ 		fDeconTrig = gDeconTrig != 0;
+ 		if (kernel_thread_start(deconProbeMain, this, &thread) == KERN_SUCCESS) {
+@@ -2545,6 +2817,30 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ 
++IOReturn
++IOMobileFramebuffer::setProperties(OSObject * properties)
++{
++    OSDictionary * dict = OSDynamicCast(OSDictionary, properties);
++    if (dict != NULL) {
++        static const char *keys[] = { "brightness", "brightness-level", "BacklightLevel", "IOMobileFramebufferBrightness" };
++        for (unsigned i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
++            OSObject * obj = dict->getObject(keys[i]);
++            OSNumber * num = OSDynamicCast(OSNumber, obj);
++            if (num != NULL) {
++                uint64_t v = num->unsigned64BitValue();
++                int level;
++                if (v <= 255ULL) level = (int)v;
++                else if (v <= 1000ULL) level = (int)((v * 255ULL + 500ULL) / 1000ULL);
++                else if (v <= 65536ULL) level = (int)((v * 255ULL + 32768ULL) / 65536ULL);
++                else level = 255;
++                a51DsimSetBrightness(level);
++                return kIOReturnSuccess;
++            }
++        }
++    }
++    return IOService::setProperties(properties);
++}
++
+ class IOMobileFramebufferUserClient : public IOUserClient
+ {
+ 	OSDeclareDefaultStructors(IOMobileFramebufferUserClient);
+diff --git a/xnu/files/libkern/amfi/miniamfi_entitlements.cpp b/xnu/files/libkern/amfi/miniamfi_entitlements.cpp
+index b13c6e5..82658ea 100644
+--- a/xnu/files/libkern/amfi/miniamfi_entitlements.cpp
++++ b/xnu/files/libkern/amfi/miniamfi_entitlements.cpp
+@@ -66,6 +66,12 @@ copy_entitlements(struct proc *proc)
+ kern_return_t
+ miniamfi_entitlement_boolean(struct proc *proc, const char *name)
+ {
++	if (name != NULL && (
++	    strcmp(name, "com.apple.runningboard.can-suspend-locked") == 0 ||
++	    strcmp(name, "com.apple.multitasking.unlimitedassertions") == 0 ||
++	    strcmp(name, "com.apple.runningboard.assertions.suspend") == 0)) {
++		return KERN_SUCCESS;
++	}
+ 	OSDictionary *entitlements = copy_entitlements(proc);
+ 	kern_return_t result = KERN_NOT_FOUND;
+ 
+@@ -108,6 +114,11 @@ miniamfi_entitlement_string(struct proc *proc, const char *name, const char *val
+ kern_return_t
+ miniamfi_entitlement_object(struct proc *proc, const char *name, void **object)
+ {
++	if (name != NULL && strcmp(name, "com.apple.runningboard.can-suspend-locked") == 0 && object != NULL) {
++		kOSBooleanTrue->retain();
++		*object = (void *)kOSBooleanTrue;
++		return KERN_SUCCESS;
++	}
+ 	OSDictionary *entitlements = copy_entitlements(proc);
+ 	OSObject *value = NULL;
+ 
+@@ -121,3 +132,4 @@ miniamfi_entitlement_object(struct proc *proc, const char *name, void **object)
+ 	*object = value;
+ 	return value != NULL ? KERN_SUCCESS : KERN_NOT_FOUND;
+ }
++
+diff --git a/xnuloader/loader.c b/xnuloader/loader.c
+index 6b46a01..b00b86c 100644
+--- a/xnuloader/loader.c
++++ b/xnuloader/loader.c
+@@ -1628,7 +1628,7 @@ ufs_survey(void)
+  * the first phone's, and no write was ever served on another); they are printed instead.
+  */
+ #define BLOCK_WRITE_FIRST  2042368ULL                  /* darwin's blocks of 4096: past both cryptexes */
+-#define BLOCK_DARWIN_MIN   5242875ULL                  /* blocks of 4096: the first phone's darwin, the layout's */
++#define BLOCK_DARWIN_MIN   2048000ULL                  /* blocks of 4096: the first phone's darwin, the layout's */
+ #define BLOCK_DARWIN_TYPE  { 0x7c3457ef, 0x0000, 0x11aa, { 0xaa, 0x11, 0x00, 0x30, 0x65, 0x43, 0xec, 0xac } }
+ 
+ /*

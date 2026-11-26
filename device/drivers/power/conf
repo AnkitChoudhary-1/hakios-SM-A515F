@@ -1,0 +1,4 @@
+# Dedicated Exynos battery bus; no Qualcomm charger path.
+driver A51BATTERY
+    file bsd/dev/hakios.a51battery.c
+    help a51battery=1 register diagnostics, =2 measured Darwin battery status; no charging writes

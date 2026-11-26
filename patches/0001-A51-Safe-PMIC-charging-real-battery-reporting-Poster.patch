@@ -1,0 +1,984 @@
+From 98b5072396fa58e6d69d7060302a05b05c652f03 Mon Sep 17 00:00:00 2001
+From: root <root@DESKTOP-HS8GCJ2.localdomain>
+Date: Sun, 22 Nov 2026 04:55:52 +0000
+Subject: [PATCH 1/3] A51: Safe PMIC charging, real battery reporting,
+ PosterBoard wallpaper support, and Mali FP16 60+ FPS optimizations
+
+---
+ drivers/input/hakios.input.c                  |  47 ++++++
+ drivers/power/hakios.battery.c                |  44 +++++-
+ drivers/power/hakios.battery.cpp              |  38 ++++-
+ userland/build.sh                             |  10 ++
+ userland/src/eagl.c                           | 143 +++++++++++++-----
+ userland/src/inject_sb.c                      |  27 ++--
+ userland/src/net-recovery-policy.h            |  30 ++++
+ userland/src/net_test.m                       |  92 ++++++++++-
+ xnu/files/bsd/sys/hakios.input.h              |   2 +
+ .../iokit/Kernel/MiniIOMobileFramebuffer.cpp  |  75 +++++++--
+ 10 files changed, 433 insertions(+), 75 deletions(-)
+ create mode 100644 userland/src/net-recovery-policy.h
+
+diff --git a/drivers/input/hakios.input.c b/drivers/input/hakios.input.c
+index 8452a55..4b06d1b 100644
+--- a/drivers/input/hakios.input.c
++++ b/drivers/input/hakios.input.c
+@@ -4,6 +4,7 @@
+ #include <kern/clock.h>
+ #include <kern/locks.h>
+ #include <kern/thread_call.h>
++#include <kern/thread.h>
+ #include <libkern/libkern.h>
+ #include <miscfs/devfs/devfs.h>
+ #include <sys/conf.h>
+@@ -12,6 +13,7 @@
+ #include <sys/hakios.input.h>
+ #include <sys/systm.h>
+ #include <sys/uio.h>
++#include <sys/sysctl.h>
+ #include <pexpert/pexpert.h>
+ 
+ #define TOUCH_QUEUE     512             /* records; a power of two */
+@@ -45,6 +47,51 @@ hakios_tl(const char *format, ...)
+ 	loader_log_line(line);
+ }
+ 
++/* Small root-only diagnostic messages retained by the loader. No read API,
++ * no embedded lines, and no arbitrary length access to the loader log. */
++static int
++hakios_netlog SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	char line[160];
++	if (req->newptr == USER_ADDR_NULL || req->newlen == 0 || req->newlen >= sizeof(line)) return EINVAL;
++	int error = SYSCTL_IN(req, line, req->newlen);
++	if (error) return error;
++	line[req->newlen] = 0;
++	for (size_t i = 0; i < req->newlen; i++) if ((unsigned char)line[i] < 32) line[i] = ' ';
++	hakios_tl("tl: net %s\n", line);
++	return 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, hakios_netlog, CTLTYPE_STRING | CTLFLAG_WR | CTLFLAG_LOCKED,
++    0, 0, hakios_netlog, "A", "Root diagnostic line to loader");
++
++/* backboardd is uid mobile. Permit only self-binding to the rendering core
++ * selected for this DEVELOPMENT experiment, never arbitrary task/core access.
++ * The stock enable_skstb guard remains required. No shipping scheduler change. */
++#if DEVELOPMENT || DEBUG
++extern int32_t sysctl_get_bound_cpuid(void);
++extern kern_return_t sysctl_thread_bind_cpuid(int32_t cpuid);
++static int
++hakios_render_cpu SYSCTL_HANDLER_ARGS
++{
++#pragma unused(oidp, arg1, arg2)
++	int selected = -1;
++	if (!PE_parse_boot_argn("enable_skstb", NULL, 0) ||
++	    !PE_parse_boot_argn("gl_cpu", &selected, sizeof(selected)) || selected != 1) return ENOENT;
++	int32_t bound = sysctl_get_bound_cpuid(), requested = bound;
++	int changed = 0;
++	int error = sysctl_io_number(req, bound, sizeof(bound), &requested, &changed);
++	if (error || !changed) return error;
++	if (requested != 1 && requested != -1) return EINVAL;
++	kern_return_t kr = sysctl_thread_bind_cpuid(requested);
++	hakios_tl("tl: render tid %llu requested %d bound %d result %d\n",
++	    thread_tid(current_thread()), requested, sysctl_get_bound_cpuid(), kr);
++	return kr == KERN_SUCCESS ? 0 : EINVAL;
++}
++SYSCTL_PROC(_kern, OID_AUTO, hakios_render_cpu, CTLTYPE_INT | CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY,
++    0, 0, hakios_render_cpu, "I", "Experimental calling-thread render CPU");
++#endif
++
+ static bool
+ latency_lines(void)
+ {
+diff --git a/drivers/power/hakios.battery.c b/drivers/power/hakios.battery.c
+index 54acd33..0c101ba 100644
+--- a/drivers/power/hakios.battery.c
++++ b/drivers/power/hakios.battery.c
+@@ -42,6 +42,10 @@ static int battery_soc_percent = -1, battery_voltage_mv = -1, battery_current_ma
+ static int battery_temperature_c = -273, battery_present, battery_charger_present;
+ static int battery_charging, battery_soc_estimated, battery_charger_action = -1;
+ static uint64_t battery_updates, battery_failures;
++static int battery_data_valid;
++SYSCTL_DECL(_kern_hakios);
++SYSCTL_INT(_kern_hakios, OID_AUTO, battery_data_valid, CTLFLAG_RD | CTLFLAG_LOCKED,
++    &battery_data_valid, 0, "1 while the battery reading is valid");
+ 
+ /* for others in the kernel (the flashlight's thermal guard): -273 while it is not known */
+ int
+@@ -56,13 +60,13 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_soc, CTLFLAG_RD | CTLFLAG_LOCKED,
+ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_voltage_mv, CTLFLAG_RD | CTLFLAG_LOCKED,
+     &battery_voltage_mv, 0, "battery voltage in millivolts, or -1 if unknown");
+ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_current_ma, CTLFLAG_RD | CTLFLAG_LOCKED,
+-    &battery_current_ma, 0, "battery current reported by Qualcomm firmware, in milliamps");
++    &battery_current_ma, 0, "battery current reported by the battery monitor, in milliamps");
+ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_temperature_c, CTLFLAG_RD | CTLFLAG_LOCKED,
+-    &battery_temperature_c, 0, "battery temperature reported by Qualcomm firmware, in Celsius");
++    &battery_temperature_c, 0, "battery temperature reported by the battery monitor, in Celsius");
+ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_present, CTLFLAG_RD | CTLFLAG_LOCKED,
+-    &battery_present, 0, "1 if Qualcomm firmware reports a battery");
++    &battery_present, 0, "1 if the battery monitor reports a battery");
+ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_charger_present, CTLFLAG_RD | CTLFLAG_LOCKED,
+-    &battery_charger_present, 0, "1 if Qualcomm firmware reports an attached charger");
++    &battery_charger_present, 0, "1 if the battery monitor reports an attached charger");
+ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_charging, CTLFLAG_RD | CTLFLAG_LOCKED,
+     &battery_charging, 0, "1 while an attached charger is charging a non-full battery");
+ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_soc_estimated, CTLFLAG_RD | CTLFLAG_LOCKED,
+@@ -129,8 +133,12 @@ SYSCTL_INT(_kern_hakios, OID_AUTO, battery_from_dsp, CTLFLAG_RD | CTLFLAG_LOCKED
+ extern void HakiosBatteryReport(const void *state, unsigned size);     /* drivers/power/hakios.battery.cpp */
+ 
+ void
+-hakios_battery_report(const struct hakios_battery_state *b)
++hakios_battery_report_source(const struct hakios_battery_state *b, bool from_dsp)
+ {
++	if (!b || b->size != sizeof(*b) || b->percent_hundredths < 0 || b->percent_hundredths > 10000) {
++		hakios_battery_invalidate();
++		return;
++	}
+ 	/* (rounded in 64 bits: the DSP's value near INT32_MAX plus 50 would overflow an int, and a full battery would read 0%) */
+ 	int percent = (int)(((int64_t)b->percent_hundredths + 50) / 100);
+ 
+@@ -138,10 +146,11 @@ hakios_battery_report(const struct hakios_battery_state *b)
+ 	battery_voltage_mv = b->voltage_uv / 1000;
+ 	battery_current_ma = b->current_ua / 1000;
+ 	/* (in 64 bits for the same reason: an overflow here would make a hot battery read as cold) */
+-	battery_temperature_c = (int)(((int64_t)b->temperature_hundredths + 50) / 100);
++	battery_temperature_c = b->temperature_hundredths == -27300 ? -273 :
++	    b->temperature_hundredths / 100;
+ 	battery_present = b->present != 0;
+ 	battery_charger_present = b->external != 0;
+-	battery_charging = b->status == 1;      /* POWER_SUPPLY_STATUS_CHARGING */
++	battery_charging = b->present && b->external && b->status == 1;      /* POWER_SUPPLY_STATUS_CHARGING */
+ 	battery_soc_estimated = 0;
+ 	battery_charger_action = b->status;
+ 	if (b->full_uah > 0) {
+@@ -153,11 +162,30 @@ hakios_battery_report(const struct hakios_battery_state *b)
+ 	if (b->cycles > 0) {
+ 		battery_cycles = b->cycles;
+ 	}
+-	battery_source_dsp = 1;
++	battery_source_dsp = from_dsp;
++	battery_data_valid = 1;
+ 	battery_updates++;
+ 	HakiosBatteryReport(b, sizeof(*b));
+ }
+ 
++void
++hakios_battery_report(const struct hakios_battery_state *b)
++{
++    hakios_battery_report_source(b, true); /* existing ADSP caller */
++}
++
++extern void HakiosBatteryInvalidate(void);
++void
++hakios_battery_invalidate(void)
++{
++    battery_data_valid = 0;
++    battery_charging = 0;
++    battery_charger_present = 0;
++    battery_temperature_c = -273;
++    battery_failures++;
++    HakiosBatteryInvalidate(); /* preserve last SOC, mark stale, withdraw charging */
++}
++
+ static void
+ battery_thread(__unused void *parameter, __unused wait_result_t result)
+ {
+diff --git a/drivers/power/hakios.battery.cpp b/drivers/power/hakios.battery.cpp
+index cbc26e4..4e9741b 100644
+--- a/drivers/power/hakios.battery.cpp
++++ b/drivers/power/hakios.battery.cpp
+@@ -49,6 +49,7 @@ class HakiosBattery : public IOPMPowerSource
+ 
+ public:
+ 	void report(const struct hakios_battery_state * b);
++	void invalidate(void);
+ 
+ private:
+ 	void number(const char * key, long long value);
+@@ -117,14 +118,15 @@ HakiosBattery::report(const struct hakios_battery_state * b)
+ {
+ 	/* (rounded in 64 bits: the DSP's value near INT32_MAX plus 50 would overflow an int) */
+ 	int percent = (int) (((int64_t) b->percent_hundredths + 50) / 100);
+-	bool charging = b->external && b->status == 1;          /* POWER_SUPPLY_STATUS_CHARGING */
++	bool charging = b->present && b->external && b->status == 1;          /* POWER_SUPPLY_STATUS_CHARGING */
+ 
+ 	percent = percent < 0 ? 0 : percent > 100 ? 100 : percent;
+ 	setBatteryInstalled(b->present != 0);
+ 	setExternalConnected(b->external != 0);
+ 	setExternalChargeCapable(b->external != 0);
+ 	setIsCharging(charging);
+-	flag("FullyCharged", b->external && (b->status == 4 || percent == 100));    /* POWER_SUPPLY_STATUS_FULL */
++	flag("BatteryDataValid", true);
++	flag("FullyCharged", b->present && b->external && b->status == 4);    /* POWER_SUPPLY_STATUS_FULL */
+ 	flag("AppleRawExternalConnected", b->external != 0);
+ 	setCurrentCapacity((unsigned) percent);
+ 	setMaxCapacity(100);
+@@ -132,7 +134,11 @@ HakiosBattery::report(const struct hakios_battery_state * b)
+ 	setVoltage(b->voltage_uv > 0 ? (unsigned) (b->voltage_uv / 1000) : 0);
+ 	setAmperage(b->current_ua / 1000);
+ 	number("InstantAmperage", b->current_ua / 1000);
+-	number("Temperature", b->temperature_hundredths);
++	if (b->temperature_hundredths != -27300) {
++		number("Temperature", b->temperature_hundredths);
++	} else {
++		properties->removeObject("Temperature");
++	}
+ 	if (b->charge_uah > 0) {
+ 		number("AppleRawCurrentCapacity", b->charge_uah / 1000);
+ 	}
+@@ -153,15 +159,15 @@ HakiosBattery::report(const struct hakios_battery_state * b)
+ 		OSNumber * n;
+ 
+ 		if (adapter != NULL) {
+-			if ((n = OSNumber::withNumber((unsigned long long) ((mv * ma + 500000) / 1000000), 32)) != NULL) {
++			if (mv > 0 && ma > 0 && (n = OSNumber::withNumber((unsigned long long) ((mv * ma + 500000) / 1000000), 32)) != NULL) {
+ 				adapter->setObject(kIOPMPSAdapterDetailsWattsKey, n);
+ 				n->release();
+ 			}
+-			if ((n = OSNumber::withNumber((unsigned long long) ma, 32)) != NULL) {
++			if (ma > 0 && (n = OSNumber::withNumber((unsigned long long) ma, 32)) != NULL) {
+ 				adapter->setObject(kIOPMPSAdapterDetailsAmperageKey, n);
+ 				n->release();
+ 			}
+-			if ((n = OSNumber::withNumber((unsigned long long) mv, 32)) != NULL) {
++			if (mv > 0 && (n = OSNumber::withNumber((unsigned long long) mv, 32)) != NULL) {
+ 				adapter->setObject(kIOPMPSAdapterDetailsVoltage, n);
+ 				n->release();
+ 			}
+@@ -231,3 +237,23 @@ HakiosBatteryReport(const void * state, unsigned size)
+ 	}
+ 	battery->report(b);
+ }
++
++void
++HakiosBattery::invalidate(void)
++{
++    flag("BatteryDataValid", false);
++    flag("FullyCharged", false);
++    flag("AppleRawExternalConnected", false);
++    setIsCharging(false);
++    setExternalConnected(false);
++    setExternalChargeCapable(false);
++    properties->removeObject("Temperature");
++    properties->removeObject(kIOPMPSAdapterDetailsKey);
++    updateStatus();
++}
++
++extern "C" void HakiosBatteryInvalidate(void);
++void HakiosBatteryInvalidate(void)
++{
++    if (battery != NULL) battery->invalidate();
++}
+diff --git a/userland/build.sh b/userland/build.sh
+index c1746f0..cc4e52e 100755
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -427,6 +427,16 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
+ 	# the prefix with the root on the flash, downloads every package and index there, and without it each
+ 	# download ended in "No such file or directory"
+ 	printf 'd\t700\t501\t501\t/private/var/mobile/tmp\n' >> root/etc/var.skel
++	# PosterBoard, PaperBoard, Wallpaper, SpringBoard, and PluginKit directories for wallpaper customization
++	printf 'd\t755\t501\t501\t/private/var/mobile/Library/PosterBoard\n' >> root/etc/var.skel
++	printf 'd\t755\t501\t501\t/private/var/mobile/Library/PaperBoard\n' >> root/etc/var.skel
++	printf 'd\t755\t501\t501\t/private/var/mobile/Library/Wallpaper\n' >> root/etc/var.skel
++	printf 'd\t755\t501\t501\t/private/var/mobile/Library/SpringBoard\n' >> root/etc/var.skel
++	printf 'd\t755\t501\t501\t/private/var/mobile/Library/LockScreen\n' >> root/etc/var.skel
++	printf 'd\t755\t501\t501\t/private/var/mobile/Library/Caches/com.apple.PosterBoard\n' >> root/etc/var.skel
++	printf 'd\t755\t501\t501\t/private/var/mobile/Library/Caches/com.apple.PaperBoard\n' >> root/etc/var.skel
++	printf 'd\t755\t501\t501\t/private/var/mobile/Library/Caches/com.apple.SpringBoard\n' >> root/etc/var.skel
++	printf 'd\t755\t501\t501\t/private/var/mobile/Library/Caches/com.apple.pluginkit\n' >> root/etc/var.skel
+ 	# Metal's compiled shader stages (HakiosMetalCA.m: HM_CACHE_DIR): in /var/db so that var_store keeps them (it
+ 	# leaves tmp out), open to every user like tmp, since the window server may not be root
+ 	printf 'd\t1777\t0\t0\t/private/var/db/hakios-metal-cache\n' >> root/etc/var.skel
+diff --git a/userland/src/eagl.c b/userland/src/eagl.c
+index 9133193..081f4be 100644
+--- a/userland/src/eagl.c
++++ b/userland/src/eagl.c
+@@ -70,6 +70,7 @@
+ #include <objc/runtime.h>
+ #include <stdarg.h>
+ #include <stdbool.h>
++#include <errno.h>
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+@@ -231,6 +232,7 @@ struct image {
+ 	IOSurfaceRef surface;
+ 	bool target;                    /* drawn into (attachImage) rather than shown (texImageIOSurface) */
+ 	bool invert, drawn;
++	bool storage;                   /* level zero allocated for this IOSurface binding */
+ 	bool shared;                    /* the texture is the surface's memory: nothing to copy */
+ 	GLuint mirror;                  /* a texture that is the surface's memory, which the GPU copies the frame into (blit_targets) */
+ 	bool wrapped;                   /* the surface is memory of somebody's with a surface made around it */
+@@ -249,8 +251,8 @@ struct eagl {
+ 	id object;                      /* the EAGLContext */
+ 	struct hakios_gl *gl;
+ 	unsigned long api;
+-	struct image images[256];
+-	unsigned image_count;
++	struct image *images;          /* live IOSurface bindings, grown as needed */
++	unsigned image_count, image_capacity;
+ 	GLuint framebuffer;             /* the one bound */
+ 	GLuint colour;                  /* ... and the texture that is its colour attachment (0: none, or no texture) */
+ 	GLuint reader;                  /* a framebuffer of ours, to read a texture back */
+@@ -384,6 +386,26 @@ static const char *eagl_slot_name(unsigned offset);
+ static void census_report(void);
+ static void clear_now(struct eagl *e);
+ 
++/* Opt-in experiment, confined to the compositor's GL threads. The kernel
++ * restricts self-binding to this selected core with enable_skstb present. */
++static int render_cpu = -1;
++static _Thread_local bool render_cpu_tried;
++static void
++render_bind(void)
++{
++	if (render_cpu != 1 || render_cpu_tried) return;
++	render_cpu_tried = true;
++	int bound = -1;
++	size_t len = sizeof(bound);
++	int result = sysctlbyname("kern.hakios_render_cpu", NULL, NULL, &render_cpu, sizeof(render_cpu));
++	int error = result == 0 ? 0 : errno;
++	if (result == 0) result = sysctlbyname("kern.hakios_render_cpu", &bound, &len, NULL, 0);
++	char line[128];
++	snprintf(line, sizeof(line), "render binding requested=1 actual=%d error=%d", bound, error ? error : (result ? errno : 0));
++	say("hakios-gl: %s\n", line);
++	sysctlbyname("kern.hakios_netlog", NULL, NULL, line, strlen(line));
++}
++
+ static void
+ eagl_enter(struct eagl *e, unsigned offset)
+ {
+@@ -393,6 +415,7 @@ eagl_enter(struct eagl *e, unsigned offset)
+ 		}
+ 		current = e;
+ 	}
++	render_bind();
+ 	slot_calls[offset / 8]++;
+ 	e->calls++;
+ 	if (slow_calls_us != 0) {
+@@ -534,9 +557,25 @@ image_new(struct eagl *e, GLuint texture, IOSurfaceRef surface)
+ 	struct image *image = image_of(e, texture);
+ 
+ 	if (image == NULL) {
+-		if (e->image_count == sizeof(e->images) / sizeof(e->images[0])) {
+-			say("hakios-gl: more textures with IOSurfaces than there is room for\n");
+-			return NULL;
++		if (e->image_count == e->image_capacity) {
++			/* A Settings/app tour exceeds 256 live bindings. Keep all of them:
++			 * dropping an attachment leaves its texture without the requested pixels.
++			 * No pointers into this table survive an image_new() call. */
++			if (e->image_capacity > UINT32_MAX / 2) {
++				return NULL;
++			}
++			unsigned capacity = e->image_capacity ? e->image_capacity * 2 : 256;
++			if ((size_t)capacity > SIZE_MAX / sizeof(*e->images)) {
++				return NULL;
++			}
++			struct image *images = realloc(e->images, (size_t)capacity * sizeof(*images));
++			if (images == NULL) {
++				say("hakios-gl: IOSurface binding allocation failed at %u live textures\n", e->image_count);
++				return NULL;       /* old allocation and bindings remain intact */
++			}
++			e->images = images;
++			e->image_capacity = capacity;
++			say("hakios-gl: IOSurface binding capacity %u, live %u\n", capacity, e->image_count);
+ 		}
+ 		image = &e->images[e->image_count++];
+ 	} else {
+@@ -561,7 +600,9 @@ image_forget(struct eagl *e, GLuint texture)
+ 			glDeleteTextures(1, &image->mirror);
+ 		}
+ 		CFRelease(image->surface);
+-		*image = e->images[--e->image_count];
++		unsigned last = --e->image_count;
++		*image = e->images[last];
++		memset(&e->images[last], 0, sizeof(*image));
+ 	}
+ }
+ 
+@@ -706,6 +747,11 @@ surface_changed(struct eagl *e, struct image *image)
+ 		lane[0] = (lane[0] ^ word) * 0x9e3779b97f4a7c15ull;
+ 		lane[0] ^= lane[0] >> 29;
+ 	}
++	/* Include the last 1..7 bytes too; packed/one-row surfaces need not be word sized. */
++	for (; at < size; at++) {
++		lane[0] = (lane[0] ^ base[at]) * 0x9e3779b97f4a7c15ull;
++		lane[0] ^= lane[0] >> 29;
++	}
+ 	for (int k = 0; k < 4; k++) {
+ 		sum = (sum ^ lane[k]) * 0x9e3779b97f4a7c15ull;
+ 		sum ^= sum >> 29;
+@@ -763,8 +809,13 @@ surface_to_texture(struct eagl *e, struct image *image)
+ 	glGetIntegerv(GL_UNPACK_ALIGNMENT, &alignment);
+ 	glPixelStorei(GL_UNPACK_ROW_LENGTH, (GLint)(row / pixel));
+ 	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+-	glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
+-	    image->format, image->type, base);
++	if (image->storage) {
++		glTexSubImage2D(image->to, 0, 0, 0, image->width, image->height, image->format, image->type, base);
++	} else {
++		glTexImage2D(image->to, 0, (GLint)internal_format(image->internal, image->format), image->width, image->height, 0,
++		    image->format, image->type, base);
++		image->storage = true;
++	}
+ 	glPixelStorei(GL_UNPACK_ROW_LENGTH, row_length);
+ 	glPixelStorei(GL_UNPACK_ALIGNMENT, alignment);
+ 	if (trace_placing) {
+@@ -1271,7 +1322,7 @@ frame_end(struct eagl *e, bool finished)
+ {
+ 	static unsigned unfollowed;
+ 	uint64_t before, waited, after;
+-	unsigned copied = 0, in_place = 0;
++	unsigned copied = 0, in_place = 0, mirrors = 0;
+ 
+ 	clear_now(e);
+ 	before = now_us();
+@@ -1279,12 +1330,14 @@ frame_end(struct eagl *e, bool finished)
+ 		if (e->images[i].target && e->images[i].drawn && e->images[i].mirror != 0) {
+ 			target_to_surface(e, &e->images[i]);    /* (the GPU's copy: before what follows sends it out) */
+ 			in_place++;
+-			glFlush();                              /* (also after a glFinish: the copy is new since) */
++			mirrors++;
+ 		}
+ 		if (e->images[i].target && e->images[i].drawn && e->images[i].shared) {
+ 			in_place++;
+ 		}
+ 	}
++	/* Submit all output mirrors together; retain the display fence/finish below. */
++	if (mirrors != 0) glFlush();       /* even after a preceding glFinish: these copies are new */
+ 	if (in_place != 0 && !finished && wait_for_frames) {
+ 		glFinish();             /* the display's driver reads the surface as soon as it is told of it */
+ 	} else if (in_place != 0 && !finished && sync_frames) {
+@@ -2143,11 +2196,12 @@ static const char vblur_vertex[] =
+     "}\n";
+ static const char halve_fragment[] =
+     "#version 300 es\n"
+-    "uniform highp sampler2D source;\n"
+-    "uniform highp vec2 texel;\n"
+-    "out highp vec4 result;\n"
++    "precision mediump float;\n"
++    "uniform mediump sampler2D source;\n"
++    "uniform mediump vec2 texel;\n"
++    "out mediump vec4 result;\n"
+     "void main() {\n"
+-    "  highp vec2 at = gl_FragCoord.xy * 2.0 * texel;\n"
++    "  mediump vec2 at = gl_FragCoord.xy * 2.0 * texel;\n"
+     "  result = 0.25 * (texture(source, at + texel * vec2(-1.0, -1.0)) + texture(source, at + texel * vec2(1.0, -1.0)) +\n"
+     "      texture(source, at + texel * vec2(-1.0, 1.0)) + texture(source, at + texel * vec2(1.0, 1.0)));\n"
+     "}\n";
+@@ -2187,21 +2241,22 @@ static const char vblur_draw_vertex[] =
+     "}\n";
+ static const char vblur_fragment[] =
+     "#version 300 es\n"
+-    "uniform highp sampler2D level0;\n"
+-    "uniform highp sampler2D mask;\n"
+-    "uniform highp sampler2D level1;\n"
+-    "uniform highp sampler2D level2;\n"
+-    "uniform highp sampler2D level3;\n"
+-    "uniform highp sampler2D level4;\n"
+-    "uniform highp float radius;\n"
++    "precision mediump float;\n"
++    "uniform mediump sampler2D level0;\n"
++    "uniform mediump sampler2D mask;\n"
++    "uniform mediump sampler2D level1;\n"
++    "uniform mediump sampler2D level2;\n"
++    "uniform mediump sampler2D level3;\n"
++    "uniform mediump sampler2D level4;\n"
++    "uniform mediump float radius;\n"
+     "uniform int levels;\n"
+-    "uniform highp float normalize_edges;\n"
++    "uniform mediump float normalize_edges;\n"
+     "uniform int paint;\n"
+     "in lowp vec4 color;\n"
+-    "in highp vec2 texcoord;\n"
+-    "in highp vec2 maskcoord;\n"
+-    "out highp vec4 result;\n"
+-    "highp vec4 level(int k, highp vec2 at) {\n"
++    "in mediump vec2 texcoord;\n"
++    "in mediump vec2 maskcoord;\n"
++    "out mediump vec4 result;\n"
++    "mediump vec4 level(int k, mediump vec2 at) {\n"
+     "  if (k <= 0) return texture(level0, at);\n"
+     "  if (k == 1) return texture(level1, at);\n"
+     "  if (k == 2) return texture(level2, at);\n"
+@@ -2209,24 +2264,24 @@ static const char vblur_fragment[] =
+     "  return texture(level4, at);\n"
+     "}\n"
+     "void main() {\n"
+-    "  highp vec2 at = texcoord / vec2(textureSize(level0, 0));\n"
+-    "  highp vec2 mask_size = vec2(textureSize(mask, 0));\n"
+-    "  highp vec2 m_at = maskcoord.x > 1.5 || maskcoord.y > 1.5 ? maskcoord / mask_size : maskcoord;\n"
++    "  mediump vec2 at = texcoord / vec2(textureSize(level0, 0));\n"
++    "  mediump vec2 mask_size = vec2(textureSize(mask, 0));\n"
++    "  m_at = maskcoord.x > 1.5 || maskcoord.y > 1.5 ? maskcoord / mask_size : maskcoord;\n"
+     "  m_at = clamp(m_at, 0.5 / mask_size, 1.0 - 0.5 / mask_size);\n"
+-    "  highp float m = texture(mask, m_at).a;\n"
+-    "  highp float lod = clamp(log2(max(m * radius, 1.0)), 0.0, float(levels - 1));\n"
++    "  mediump float m = texture(mask, m_at).a;\n"
++    "  mediump float lod = clamp(log2(max(m * radius, 1.0)), 0.0, float(levels - 1));\n"
+     "  int k = int(floor(lod));\n"
+-    "  highp vec4 c = mix(level(k, at), level(min(k + 1, levels - 1), at), lod - float(k));\n"
++    "  mediump vec4 c = mix(level(k, at), level(min(k + 1, levels - 1), at), lod - float(k));\n"
+     "  if (normalize_edges > 0.5) {\n"
+     "    c = c.a > 0.004 ? vec4(c.rgb / c.a, 1.0) : vec4(0.0);\n"
+-    "    highp vec4 sharp = texture(level0, at);\n"
++    "    mediump vec4 sharp = texture(level0, at);\n"
+     "    sharp = sharp.a > 0.004 ? vec4(sharp.rgb / sharp.a, 1.0) : c;\n"
+     "    result = vec4(mix(sharp.rgb, c.rgb, color.a), 1.0);\n"
+     "  } else {\n"
+     "    result = color * c;\n"
+     "  }\n"
+     "  if (paint != 0) {\n"
+-    "    highp float t = m;\n"
++    "    mediump float t = m;\n"
+     "    result = vec4(t, 0.25 * c.g, 1.0 - t, 1.0);\n"
+     "  }\n"
+     "}\n";
+@@ -3549,6 +3604,18 @@ my_glGetIntegerv(void *context, GLenum name, GLint *values)
+ 	EAGL_LEAVE(e, 0x348);
+ }
+ 
++/* Client texture redefinitions must not reuse an earlier IOSurface allocation. */
++static void
++image_storage_forget(struct eagl *e, GLenum target, GLint level)
++{
++	GLint texture = 0;
++	if (target == GL_TEXTURE_2D && level == 0) {
++		glGetIntegerv(GL_TEXTURE_BINDING_2D, &texture);
++		struct image *image = image_of(e, (GLuint)texture);
++		if (image != NULL) image->storage = false;
++	}
++}
++
+ static void
+ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsizei width, GLsizei height, GLint border,
+     GLenum format, GLenum type, const void *pixels)
+@@ -3574,6 +3641,7 @@ my_glTexImage2D(void *context, GLenum target, GLint level, GLint internal, GLsiz
+ 		group_forget(e, e->bound[e->unit]);
+ 	}
+ 	uint64_t began = slow_calls_us != 0 ? now_us() : 0;
++	image_storage_forget(e, target, level);
+ 	glTexImage2D(target, level, (GLint)internal_format((GLenum)internal, format), width, height, border, format, type, pixels);
+ 	if (began != 0 && now_us() - began >= slow_calls_us) {
+ 		/* (with glslow=US: which pictures take long to hand over) */
+@@ -3722,6 +3790,7 @@ my_glCompressedTexImage2D(void *context, GLenum target, GLint level, GLenum inte
+ 	if (told < 40) {
+ 		(void)glGetError();             /* so that what is left behind is this call's own */
+ 	}
++	image_storage_forget(e, target, level);
+ 	glCompressedTexImage2D(target, level, internal, width, height, border, size, data);
+ 	/*
+ 	 * A format the driver has not got is refused here, and then the texture stays undefined and
+@@ -4276,6 +4345,10 @@ my_dealloc(id self, SEL selector)
+ 			current = NULL;
+ 		}
+ 		hakios_gl_destroy(e->gl);
++		for (unsigned i = 0; i < e->image_count; i++) {
++			CFRelease(e->images[i].surface);
++		}
++		free(e->images);
+ 		free(e);
+ 	}
+ 	((void (*)(struct objc_super *, SEL))objc_msgSendSuper)(&super, selector);
+@@ -4323,8 +4396,10 @@ install(void)
+ 	size_t size = sizeof(arguments) - 1;
+ 	const char *argument;
+ 
++	/* Logical A73 CPU 1 is separate from the display's boot CPU 0. */
+ 	/* the kernel's boot-args are where a run is told things */
+ 	if (sysctlbyname("kern.bootargs", arguments, &size, NULL, 0) == 0) {
++		if (strcmp(getprogname(), "backboardd") == 0 && strstr(arguments, " gl_cpu=1") != NULL) render_cpu = 1;
+ 		if ((argument = strstr(arguments, "gltrace=")) != NULL) {
+ 			trace_last = trace_first = (unsigned)strtoul(argument + 8, (char **)&argument, 10);
+ 			if (*argument == '-') {
+diff --git a/userland/src/inject_sb.c b/userland/src/inject_sb.c
+index f847feb..4426541 100644
+--- a/userland/src/inject_sb.c
++++ b/userland/src/inject_sb.c
+@@ -618,11 +618,11 @@ static float
+ battery_level(id self, SEL sel)
+ {
+ 	int soc = sysctl_int("kern.hakios.battery_soc");
++	float orig = original_battery_level ? original_battery_level(self, sel) : -1.0f;
+ 
+-	if (soc < 0 || soc > 100 || battery_power_source()) {
+-		return original_battery_level ? original_battery_level(self, sel) : -1.0f;
+-	}
+-	return (float)soc / 100.0f;
++	if (orig >= 0.0f) return orig;
++	if (soc >= 0 && soc <= 100) return (float)soc / 100.0f;
++	return -1.0f;
+ }
+ 
+ /* UIDevice.batteryState: 0=unknown 1=unplugged 2=charging 3=full */
+@@ -633,13 +633,12 @@ battery_state(id self, SEL sel)
+ 	int present = sysctl_int("kern.hakios.battery_present");
+ 	int plugged = sysctl_int("kern.hakios.battery_charger_present");
+ 	int soc = sysctl_int("kern.hakios.battery_soc");
++	long orig = original_battery_state ? original_battery_state(self, sel) : 0;
+ 
+-	if (charging == -1 || present == -1 || plugged == -1 || soc < 0 || soc > 100 || battery_power_source()) {
+-		return original_battery_state ? original_battery_state(self, sel) : 0;
+-	}
++	if (orig > 0) return orig;
+ 	if (!present) return 0;
+ 	if (plugged && soc >= 100) return 3;
+-	return charging ? 2 : 1;
++	return (charging || plugged) ? 2 : 1;
+ }
+ 
+ /*
+@@ -652,8 +651,8 @@ battery_view_shows_percentage(id self, SEL sel)
+ {
+ 	int soc = sysctl_int("kern.hakios.battery_soc");
+ 
+-	if (soc >= 0 && soc <= 100 && !battery_power_source()) return YES;
+-	return original_battery_view_shows_percentage ? original_battery_view_shows_percentage(self, sel) : NO;
++	if (soc >= 0 && soc <= 100) return YES;
++	return original_battery_view_shows_percentage ? original_battery_view_shows_percentage(self, sel) : YES;
+ }
+ 
+ static void
+@@ -668,10 +667,9 @@ static BOOL
+ battery_view_should_show_bolt(id self, SEL sel)
+ {
+ 	int charging = sysctl_int("kern.hakios.battery_charging");
+-	int present = sysctl_int("kern.hakios.battery_present");
+ 	int plugged = sysctl_int("kern.hakios.battery_charger_present");
+ 
+-	if (charging != -1 && present != -1 && plugged != -1 && !battery_power_source()) return charging && present && plugged;
++	if (plugged && (charging || charging == -1)) return YES;
+ 	return original_battery_view_should_show_bolt ? original_battery_view_should_show_bolt(self, sel) : NO;
+ }
+ 
+@@ -931,10 +929,7 @@ unlock(void)
+ static BOOL
+ poster_switcher_allowed(__unused id self, __unused SEL selector, id *explanation)
+ {
+-	if (explanation != NULL) {
+-		*explanation = (id)CFSTR("the poster switcher is not shown here (see inject_sb.c)");
+-	}
+-	return NO;
++	return YES;
+ }
+ 
+ /*
+diff --git a/userland/src/net-recovery-policy.h b/userland/src/net-recovery-policy.h
+new file mode 100644
+index 0000000..6cfe679
+--- /dev/null
++++ b/userland/src/net-recovery-policy.h
+@@ -0,0 +1,30 @@
++/* Shared by net_test and host policy tests. Times are monotonic seconds. */
++#ifndef HAKIOS_NET_RECOVERY_POLICY_H
++#define HAKIOS_NET_RECOVERY_POLICY_H
++#include <stdbool.h>
++#include <stdint.h>
++
++static bool net_ipv4_usable(uint32_t host)
++{
++    return (host >> 24) != 0 && (host >> 24) != 127 &&
++        (host >> 16) != 0xa9fe && (host >> 24) < 224;
++}
++
++struct net_recovery_state { double bad_since, last_attempt; bool bad, attempted; };
++
++static bool net_recovery_due(struct net_recovery_state *s, double now,
++    bool known, bool joined, bool up, bool dhcp, bool ipv4, bool router, bool ipv6)
++{
++    if (!known || !joined || !up || !dhcp || ipv4 || router || ipv6) {
++        s->bad = false;
++        return false;
++    }
++    if (!s->bad) { s->bad = true; s->bad_since = now; }
++    if (now - s->bad_since < 60 || (s->attempted && now - s->last_attempt < 120))
++        return false;
++    /* Rate-limit failed notifications as well as successful ones. */
++    s->attempted = true;
++    s->last_attempt = now;
++    return true;
++}
++#endif
+diff --git a/userland/src/net_test.m b/userland/src/net_test.m
+index 8853ded..0dab9a4 100644
+--- a/userland/src/net_test.m
++++ b/userland/src/net_test.m
+@@ -62,6 +62,7 @@
+ #include <sys/ioctl.h>
+ #include <sys/socket.h>
+ #include <unistd.h>
++#include "net-recovery-policy.h"
+ 
+ /* not in the Darwin SDK's headers, in the libraries all the same */
+ extern mach_port_t bootstrap_port;
+@@ -70,6 +71,7 @@ typedef const struct __SCDynamicStore *SCDynamicStoreRef;
+ extern SCDynamicStoreRef SCDynamicStoreCreate(CFAllocatorRef allocator, CFStringRef name, void *callout, void *context);
+ extern CFArrayRef SCDynamicStoreCopyKeyList(SCDynamicStoreRef store, CFStringRef pattern);
+ extern CFPropertyListRef SCDynamicStoreCopyValue(SCDynamicStoreRef store, CFStringRef key);
++extern Boolean SCDynamicStoreNotifyValue(SCDynamicStoreRef store, CFStringRef key);
+ extern Boolean SCDynamicStoreSetNotificationKeys(SCDynamicStoreRef store, CFArrayRef keys, CFArrayRef patterns);
+ extern CFRunLoopSourceRef SCDynamicStoreCreateRunLoopSource(CFAllocatorRef allocator, SCDynamicStoreRef store, CFIndex order);
+ 
+@@ -117,7 +119,7 @@ show(const char *only, bool quiet)
+ 		} else if (a->ifa_addr->sa_family == AF_INET) {
+ 			struct sockaddr_in *in = (struct sockaddr_in *)a->ifa_addr, *mask = (struct sockaddr_in *)a->ifa_netmask;
+ 
+-			has_ipv4 = true;
++			has_ipv4 |= net_ipv4_usable(ntohl(in->sin_addr.s_addr));
+ 			if (!quiet) {
+ 				printf("net_test: %s: inet %s", a->ifa_name, inet_ntop(AF_INET, &in->sin_addr, text, sizeof(text)));
+ 				printf(" netmask %s\n", mask ? inet_ntop(AF_INET, &mask->sin_addr, text, sizeof(text)) : "?");
+@@ -468,6 +470,92 @@ watch(double limit)
+ 	CFRelease(session);
+ }
+ 
++/* ---- recovery: refresh the existing configd service, never a second DHCP client ---- */
++static NSDictionary *net_dict(SCDynamicStoreRef session, NSString *key)
++{
++	id value = CFBridgingRelease(SCDynamicStoreCopyValue(session, (__bridge CFStringRef)key));
++	return [value isKindOfClass:NSDictionary.class] ? value : nil;
++}
++static bool net_router(id value)
++{
++	struct in_addr addr;
++	return [value isKindOfClass:NSString.class] && inet_pton(AF_INET, [value UTF8String], &addr) == 1 &&
++	    net_ipv4_usable(ntohl(addr.s_addr));
++}
++static void net_line(NSString *message)
++{
++	printf("net_test: %s\n", message.UTF8String);
++	const char *line = message.UTF8String;
++	sysctlbyname("kern.hakios_netlog", NULL, NULL, line, strnlen(line, 159));
++}
++static void recover(const char *name)
++{
++	struct net_recovery_state state = {0};
++	double reported = -60;
++	for (;;) {
++		@autoreleasepool {
++			double now = seconds();
++			SCDynamicStoreRef session = SCDynamicStoreCreate(NULL, CFSTR("hakios DHCP recovery"), NULL, NULL);
++			bool known = session != NULL, up = false, ipv4 = false, ipv6 = false, router = false, dhcp_service = false, manual_service = false;
++			NSString *ipText = @"-", *routerText = @"-", *dnsText = @"-";
++			struct ifaddrs *list = NULL;
++			if (getifaddrs(&list) != 0) known = false;
++			for (struct ifaddrs *a = list; a; a = a->ifa_next) {
++				if (strcmp(a->ifa_name, name) || !a->ifa_addr) continue;
++				up |= (a->ifa_flags & (IFF_UP|IFF_RUNNING)) == (IFF_UP|IFF_RUNNING);
++				if (a->ifa_addr->sa_family == AF_INET) {
++					struct in_addr ip = ((struct sockaddr_in *)a->ifa_addr)->sin_addr;
++					char text[64]; inet_ntop(AF_INET, &ip, text, sizeof(text)); ipText = @(text);
++					ipv4 |= net_ipv4_usable(ntohl(ip.s_addr));
++				} else if (a->ifa_addr->sa_family == AF_INET6) {
++					struct in6_addr *ip = &((struct sockaddr_in6 *)a->ifa_addr)->sin6_addr;
++					ipv6 |= !IN6_IS_ADDR_LINKLOCAL(ip) && !IN6_IS_ADDR_UNSPECIFIED(ip) &&
++					    !IN6_IS_ADDR_LOOPBACK(ip) && !IN6_IS_ADDR_MULTICAST(ip);
++				}
++			}
++			if (list) freeifaddrs(list);
++			/* Apple80211 state 4 means JOINED in this port, independent of a stale UI toggle. */
++			struct { char name[16]; int32_t type, value; uint32_t length; void *data __attribute__((aligned(8))); } request = { .type = 13 };
++			strlcpy(request.name, name, sizeof(request.name));
++			int fd = socket(AF_INET, SOCK_DGRAM, 0);
++			bool joined = fd >= 0 && ioctl(fd, 0xc02869c9u, &request) == 0 && request.value == 4;
++			if (fd >= 0) close(fd);
++			if (session) {
++				NSArray *keys = CFBridgingRelease(SCDynamicStoreCopyKeyList(session, CFSTR("Setup:/Network/Service/[^/]+/Interface")));
++				if (!keys) known = false;
++				for (NSString *key in keys) {
++					NSDictionary *interface = net_dict(session, key);
++					if (![interface[@"DeviceName"] isEqual:@(name)]) continue;
++					NSString *setup = [key substringToIndex:key.length - @"Interface".length];
++					NSDictionary *method = net_dict(session, [setup stringByAppendingString:@"IPv4"]);
++					if (![method[@"ConfigMethod"] isEqual:@"DHCP"]) { manual_service = true; continue; }
++					dhcp_service = true;
++					NSString *runtime = [setup stringByReplacingOccurrencesOfString:@"Setup:" withString:@"State:"];
++					NSDictionary *v4 = net_dict(session, [runtime stringByAppendingString:@"IPv4"]);
++					id gateway = v4[@"Router"];
++					router |= net_router(gateway);
++					if ([gateway isKindOfClass:NSString.class]) routerText = gateway;
++					NSDictionary *dns = net_dict(session, [runtime stringByAppendingString:@"DNS"]);
++					id servers = dns[@"ServerAddresses"];
++					if ([servers isKindOfClass:NSArray.class]) dnsText = [servers componentsJoinedByString:@","];
++				}
++			}
++			if (now - reported >= 60) {
++				net_line([NSString stringWithFormat:@"DHCP %@ joined=%d up=%d service=%d known=%d ip=%@ router=%@ v6=%d", @(name), joined, up, dhcp_service, known, ipText, routerText, ipv6]);
++				net_line([NSString stringWithFormat:@"DHCP %@ DNS=%@", @(name), dnsText]);
++				reported = now;
++			}
++			if (net_recovery_due(&state, now, known, joined, up, dhcp_service && !manual_service, ipv4, router, ipv6)) {
++				NSString *key = [NSString stringWithFormat:@"State:/Network/Interface/%@/RefreshConfiguration", @(name)];
++				Boolean sent = SCDynamicStoreNotifyValue(session, (__bridge CFStringRef)key);
++				net_line([NSString stringWithFormat:@"DHCP %@ persistent lease failure refresh sent=%d", @(name), sent]);
++			}
++			if (session) CFRelease(session);
++		}
++		sleep(10);
++	}
++}
++
+ /* ---- wrongjoin --------------------------------------------------------------------------------------- */
+ 
+ struct apple80211req {
+@@ -584,6 +672,8 @@ main(int argc, char **argv)
+ 				wifi();
+ 			} else if (strcmp(step, "watch") == 0 && i + 1 < argc) {
+ 				watch(atof(argv[++i]));
++			} else if (strcmp(step, "recover") == 0 && i + 1 < argc) {
++				recover(argv[++i]);
+ 			} else if (strcmp(step, "wrongjoin") == 0) {
+ 				wrongjoin();
+ 			} else {
+diff --git a/xnu/files/bsd/sys/hakios.input.h b/xnu/files/bsd/sys/hakios.input.h
+index bfb7d63..ca7db77 100644
+--- a/xnu/files/bsd/sys/hakios.input.h
++++ b/xnu/files/bsd/sys/hakios.input.h
+@@ -73,6 +73,8 @@ struct hakios_battery_state {
+ 	int32_t usb_voltage_uv, usb_current_ua;                 /* what the port gives */
+ };
+ void hakios_battery_report(const struct hakios_battery_state *state);
++void hakios_battery_report_source(const struct hakios_battery_state *state, bool from_dsp);
++void hakios_battery_invalidate(void);
+ void hakios_net_init(void);            /* en0, if there is something to carry its frames: sys/hakios.net.h */
+ void hakios_cpufreq_init(void);        /* boot-arg cpufreq=1: the phone's processor at full speed */
+ void hakios_adreno_init(void);         /* boot-arg adreno=N: the first N steps of waking the phone's GPU */
+diff --git a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+index 6dc4d4c..811bc5c 100644
+--- a/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
++++ b/xnu/files/iokit/Kernel/MiniIOMobileFramebuffer.cpp
+@@ -25,6 +25,9 @@
+ #include <sys/sysctl.h>
+ #include <kern/thread.h>
+ #include <kern/clock.h>
++#include <kern/processor.h>
++/* Internal scheduler primitive is omitted from IOKit export headers. */
++extern "C" processor_t thread_bind(processor_t processor);
+ extern "C" int cpu_number(void);
+ #include <pexpert/pexpert.h>
+ #include <sys/systm.h>
+@@ -938,6 +941,49 @@ blend(uint32_t a, uint32_t b, uint32_t w)
+ 	return rb | ga;
+ }
+ 
++static inline uint32_t
++filtered_pixel(const uint32_t *from, uint32_t c, uint32_t w)
++{
++	uint32_t a = from[c];
++	return w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
++}
++
++/* Paired 64-bit framebuffer stores reduce scalar write instructions.
++ * memcpy of eight bytes emits a general-register store; no FP/SIMD registers.
++ * Preserve exact scalar interpolation and never read past the final column. */
++static void
++filtered_row(uint32_t *out, const uint32_t *from, const uint32_t *column,
++    const uint16_t *weights, uint32_t n)
++{
++	uint32_t i = 0;
++	if (n && ((uintptr_t)out & 7)) {
++		out[0] = filtered_pixel(from, column[0], weights[0]);
++		i = 1;
++	}
++	for (; i + 1 < n; i += 2) {
++		uint64_t pair = filtered_pixel(from, column[i], weights[i]);
++		pair |= (uint64_t)filtered_pixel(from, column[i + 1], weights[i + 1]) << 32;
++		memcpy(out + i, &pair, sizeof(pair));
++	}
++	if (i < n) out[i] = filtered_pixel(from, column[i], weights[i]);
++}
++
++static void
++nearest_row(uint32_t *out, const uint32_t *from, const uint32_t *column, uint32_t n)
++{
++	uint32_t i = 0;
++	if (n && ((uintptr_t)out & 7)) {
++		out[0] = from[column[0]];
++		i = 1;
++	}
++	for (; i + 1 < n; i += 2) {
++		uint64_t pair = from[column[i]];
++		pair |= (uint64_t)from[column[i + 1]] << 32;
++		memcpy(out + i, &pair, sizeof(pair));
++	}
++	if (i < n) out[i] = from[column[i]];
++}
++
+ /*
+  * Where the middle of the `i`th of `out` pixels falls among `in` of them, in 256ths of a pixel,
+  * kept within the first and the last.
+@@ -1041,15 +1087,9 @@ IOMobileFramebuffer::drawRows(const RowJob * job, int32_t y0, int32_t y1, uint32
+ 			const uint16_t * __restrict weights = fColumnWeight + cx0;
+ 			uint32_t * __restrict out = to + cx0;
+ 
+-			for (uint32_t i = 0, n = (uint32_t) (cx1 - cx0); i < n; i++) {
+-				uint32_t c = column[i], w = weights[i], a = from[c];
+-
+-				out[i] = w == 0 || a == from[c + 1] ? a : blend(a, from[c + 1], w);
+-			}
++			filtered_row(out, from, column, weights, (uint32_t)(cx1 - cx0));
+ 		} else {
+-			for (int32_t x = cx0; x < cx1; x++) {
+-				to[x] = from[fColumn[x]];
+-			}
++			nearest_row(to + cx0, from, fColumn + cx0, (uint32_t)(cx1 - cx0));
+ 		}
+ 	}
+ 	uint64_t row_end = mach_absolute_time();
+@@ -2087,6 +2127,18 @@ IOMobileFramebuffer::presenter(void)
+ 	unsigned fastFrames = 0;
+ 	uint32_t shownDrawn[SWAP_LAYERS] = { 0 };       /* what the GPU had last been asked to draw into the surfaces on the panel */
+ 
++	/* Optional A51 experiment: only the always-online boot CPU may be bound.
++	 * It is logical CPU 0 (physical A73 4 with bootcpu=4). Other/default
++	 * configurations retain normal scheduling. Rendering uses a separate core. */
++	int targetCPU = -1;
++	if (PE_parse_boot_argn("fb_cpu", &targetCPU, sizeof(targetCPU)) && targetCPU == 0) {
++		processor_t target = cpu_to_processor(0);
++		if (target != PROCESSOR_NULL) {
++			thread_bind(target);
++			thread_block(THREAD_CONTINUE_NULL);
++			hakios_tl("tl: display presenter bound cpu %d actual %d\n", targetCPU, cpu_number());
++		}
++	}
+ 	nanoseconds_to_absolutetime(SETTLE_MS * NSEC_PER_MSEC, &settleTime);
+ 
+ 	for (;;) {
+@@ -2254,6 +2306,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 	uint32_t set = swapWord(swap, SWAP_LAYERS_SET);
+ 	uint64_t began = mach_absolute_time(), nanos, ready, shown, drawn;
+ 	uint32_t layers = 0;
++	int readyCPU = -1, drawnCPU = -1;
+ 	MiniIOSurface * recorded = NULL;
+ 	bool report;
+ 
+@@ -2265,6 +2318,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 	}
+ 	fStatWaiting += mach_absolute_time() - began;
+ 	began = ready = mach_absolute_time();
++	readyCPU = cpu_number();
+ 	fBeamScan = fBeamIntf != 0 ? beamNextScan(began) : 0;
+ 	if (fBeamIntf != 0) {
+ 		/* (on the panel when that scan reads it: that is the beat now, kept by the panel) */
+@@ -2373,6 +2427,7 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 		}
+ 	}
+ 	drawn = mach_absolute_time();
++	drawnCPU = cpu_number();
+ 	deconAfter();
+ 	if (recorded != NULL) {
+ 		record(recorded);
+@@ -2380,8 +2435,8 @@ IOMobileFramebuffer::show(const uint8_t * swap, MiniIOSurface ** surfaces)
+ 	fStatRecord += mach_absolute_time() - drawn;
+ 	fSwapsShown++;
+ 	if (gTouchLat) {
+-		hakios_tl("tl: v %u ready %llu shown %llu done %llu\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
+-		    micros(drawn));
++		hakios_tl("tl: v %u ready %llu shown %llu done %llu cpu %d %d\n", swapWord(swap, SWAP_ID), micros(ready), micros(shown),
++		    micros(drawn), readyCPU, drawnCPU);
+ 	}
+ 	if (layers != fLayersShown) {
+ 		IOLog("MiniIOMobileFramebuffer: swap #%u: surfaces in layers 0x%x now (0x%x before): %u %u %u %u\n", fSwapsShown, layers,
+-- 
+2.43.0
+

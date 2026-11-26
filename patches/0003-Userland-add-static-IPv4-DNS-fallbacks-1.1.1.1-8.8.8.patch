@@ -1,0 +1,26 @@
+From ae617cf381316111d5ad25b05040e5b28e1052ee Mon Sep 17 00:00:00 2001
+From: root <root@DESKTOP-HS8GCJ2.localdomain>
+Date: Sun, 22 Nov 2026 05:22:11 +0000
+Subject: [PATCH 3/3] Userland: add static IPv4 DNS fallbacks (1.1.1.1,
+ 8.8.8.8) to prevent Safari WebKit IPv6 timeout hangs
+
+---
+ userland/build.sh | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/userland/build.sh b/userland/build.sh
+index cc4e52e..78f7033 100755
+--- a/userland/build.sh
++++ b/userland/build.sh
+@@ -462,6 +462,8 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
+ 	fi
+ 	cp ${RC:-rc.launchd} root/etc/rc
+ 	cp ${RC_JOBS:-rc.jobs} root/etc/rc.jobs
++	printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\nnameserver 1.0.0.1\n" > root/etc/resolv.conf
++	printf "l\t/etc/resolv.conf\t/private/var/run/resolv.conf\n" >> root/etc/var.skel
+ 	# QUIET=1: launchd's own standard error goes nowhere (src/init.c). It says a few thousand
+ 	# lines about its own business in the first minutes and pushes everything else out of the
+ 	# kernel's log; the daemons keep their own standard error on the console all the same.
+-- 
+2.43.0
+

@@ -1,0 +1,14 @@
+# Register the included app after LaunchServices starts.
+/redwood/bin/iris-register &
+# Physical audio loudspeaker tests
+/redwood/bin/sound_test raw 5 &
+/redwood/bin/sound_test springboard route wait 3 tone 4 wait 3 system 1100 wait 2 system 1104 wait 2 file /System/Library/Audio/UISounds/New/Fanfare.caf wait 5 &
+# Commands run by the launchd job com.hakios.demo (see com.hakios.demo.plist).
+/redwood/bin/hello_dyn started by launchd
+/redwood/bin/svc_test
+/redwood/bin/surf_test
+/bin/ps -A
+/redwood/bin/mg_test
+# the processors: how many, and -- once the system has settled -- whether they work at the same time
+/redwood/bin/cpu_test
+/redwood/bin/cpu_test 240 &

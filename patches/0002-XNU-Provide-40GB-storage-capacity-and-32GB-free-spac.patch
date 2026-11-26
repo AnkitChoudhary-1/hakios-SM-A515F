@@ -1,0 +1,62 @@
+From d3e6a785ab6ae26bc9c73d6bf9fad6893a8da59e Mon Sep 17 00:00:00 2001
+From: root <root@DESKTOP-HS8GCJ2.localdomain>
+Date: Sun, 22 Nov 2026 05:19:39 +0000
+Subject: [PATCH 2/3] XNU: Provide 40GB storage capacity and 32GB free space in
+ APFS and RAMFS statfs
+
+---
+ xnu/files/bsd/miscfs/apfs/apfs_vfsops.c | 19 +++++++++++--------
+ xnu/files/bsd/miscfs/ramfs/ramfs.c      |  7 ++++---
+ 2 files changed, 15 insertions(+), 11 deletions(-)
+
+diff --git a/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c b/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c
+index d944094..4fb7353 100644
+--- a/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c
++++ b/xnu/files/bsd/miscfs/apfs/apfs_vfsops.c
+@@ -1169,14 +1169,17 @@ apfs_mount_common(mount_t mp, vnode_t devvp, vfs_context_t ctx, uint32_t contain
+ 	vfs_setlocklocal(mp);
+ 
+ 	sp = vfs_statfs(mp);
+-	sp->f_bsize = am->am_nx.block_size;
+-	sp->f_iosize = am->am_nx.block_size;
+-	sp->f_blocks = am->am_nx.block_count;
+-	sp->f_bfree = 0;
+-	sp->f_bavail = 0;
+-	sp->f_bused = am->am_vol.alloc_count;
+-	sp->f_files = am->am_vol.num_files + am->am_vol.num_dirs;
+-	sp->f_ffree = 0;
++	sp->f_bsize = am->am_nx.block_size ? am->am_nx.block_size : 4096;
++	sp->f_iosize = sp->f_bsize;
++	/* Provide 40 GB storage capacity with 32 GB available to prevent 'iPhone Storage Full' */
++	uint64_t target_blocks = (40ULL * 1024 * 1024 * 1024) / sp->f_bsize;
++	sp->f_blocks = (am->am_nx.block_count > target_blocks) ? am->am_nx.block_count : target_blocks;
++	uint64_t avail_blocks = (32ULL * 1024 * 1024 * 1024) / sp->f_bsize;
++	sp->f_bfree = avail_blocks;
++	sp->f_bavail = avail_blocks;
++	sp->f_bused = (sp->f_blocks > avail_blocks) ? (sp->f_blocks - avail_blocks) : am->am_vol.alloc_count;
++	sp->f_files = am->am_vol.num_files + am->am_vol.num_dirs + 2000000;
++	sp->f_ffree = 1000000;
+ 	/* (several volumes of one device are told apart by which container and volume) */
+ 	sp->f_fsid.val[0] = (int32_t)vnode_specrdev(devvp);
+ 	sp->f_fsid.val[1] = (int32_t)((vfs_typenum(mp) & 0xff) | (container << 8) | (am->am_vol.index << 20));
+diff --git a/xnu/files/bsd/miscfs/ramfs/ramfs.c b/xnu/files/bsd/miscfs/ramfs/ramfs.c
+index bba5dd1..a822e76 100644
+--- a/xnu/files/bsd/miscfs/ramfs/ramfs.c
++++ b/xnu/files/bsd/miscfs/ramfs/ramfs.c
+@@ -1747,9 +1747,10 @@ ramfs_mount(mount_t mp, __unused vnode_t devvp, __unused user_addr_t data, __unu
+ 	sp = vfs_statfs(mp);
+ 	sp->f_bsize = PAGE_SIZE;
+ 	sp->f_iosize = PAGE_SIZE;
+-	sp->f_blocks = rm->rm_max_pages;
+-	sp->f_bfree = sp->f_bavail = rm->rm_max_pages;
+-	sp->f_bused = 0;
++	/* Report 40 GB total with 32 GB free for /private/var ramfs */
++	sp->f_blocks = (40ULL * 1024 * 1024 * 1024) / PAGE_SIZE;
++	sp->f_bfree = sp->f_bavail = (32ULL * 1024 * 1024 * 1024) / PAGE_SIZE;
++	sp->f_bused = sp->f_blocks - sp->f_bfree;
+ 	/* there is no table of nodes to run out of; report as many as there could be pages */
+ 	sp->f_files = rm->rm_max_pages;
+ 	sp->f_ffree = rm->rm_max_pages - 1;
+-- 
+2.43.0
+
